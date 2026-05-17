@@ -1,17 +1,15 @@
 """
-Easy Face Swap — cloud edition (RunPod).
-Self-contained: only uses HuggingFace models, no local file deps.
+Easy Face Swap — cloud edition. Pure drag-drop UI, no slider tuning exposed.
 """
 import os, sys, time
 from pathlib import Path
 
-# InstantID custom pipeline lives in /workspace/InstantID (clone in setup.sh)
 sys.path.insert(0, "/workspace/InstantID")
 
 import cv2
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 import gradio as gr
 from insightface.app import FaceAnalysis
 from huggingface_hub import snapshot_download
@@ -24,6 +22,14 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DTYPE = torch.float16
 
+# Tuned defaults — hardcoded so the UI stays drag-drop only.
+IP_SCALE       = 0.85   # identity strength
+CN_SCALE       = 0.85   # controlnet pose lock
+STEPS          = 22     # diffusion quality steps
+TARGET_SIM     = 0.65   # auto-retry until match is at least this good (cosine sim)
+MAX_ATTEMPTS   = 2      # max retries per image if first attempt is weak
+GEN_SIZE       = 1024
+
 print("=" * 60)
 print("Easy Face Swap (cloud) — loading...")
 print("=" * 60)
@@ -34,9 +40,7 @@ face_app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.3)
 
 print("[2/2] InstantID + RealVisXL...")
 instantid_dir = snapshot_download("InstantX/InstantID", allow_patterns=["ControlNetModel/*", "ip-adapter.bin"])
-controlnet = ControlNetModel.from_pretrained(
-    os.path.join(instantid_dir, "ControlNetModel"), torch_dtype=DTYPE,
-)
+controlnet = ControlNetModel.from_pretrained(os.path.join(instantid_dir, "ControlNetModel"), torch_dtype=DTYPE)
 pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
     "SG161222/RealVisXL_V4.0",
     controlnet=controlnet,
@@ -58,6 +62,19 @@ pipe.set_progress_bar_config(disable=True)
 print("Ready.")
 
 
+def load_image_bgr(path):
+    """Read an image to BGR ndarray. cv2.imread fails on HEIC/exotic JPGs; fall back to PIL."""
+    img = cv2.imread(path)
+    if img is not None and img.size > 0:
+        return img
+    try:
+        with Image.open(path) as pil:
+            pil = ImageOps.exif_transpose(pil).convert("RGB")
+            return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+    except Exception as e:
+        raise RuntimeError(f"Couldn't read image: {e}")
+
+
 def cosine_sim(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
 
@@ -71,39 +88,40 @@ def biggest_face(img_bgr):
     return max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1])) if faces else None
 
 
-def swap_one(source_emb, target_path, ip_scale, cn_scale, steps, target_sim, max_attempts):
-    target_bgr = cv2.imread(target_path)
-    if target_bgr is None:
-        raise RuntimeError("Couldn't read image")
+def swap_one(source_emb, target_path):
+    target_bgr = load_image_bgr(target_path)
     tgt_face = biggest_face(target_bgr)
     if tgt_face is None:
-        raise RuntimeError("No face in target")
+        raise RuntimeError("No face detected in target")
 
+    H, W = target_bgr.shape[:2]
     x1, y1, x2, y2 = tgt_face.bbox.astype(int)
-    w, h = x2 - x1, y2 - y1
+    w, h = max(1, x2 - x1), max(1, y2 - y1)
     cx, cy = (x1+x2)//2, (y1+y2)//2
     side = int(max(w, h) * 1.3)
     side = side if side % 2 == 0 else side + 1
     sx1 = max(0, cx - side//2); sy1 = max(0, cy - side//2)
-    sx2 = min(target_bgr.shape[1], sx1 + side); sy2 = min(target_bgr.shape[0], sy1 + side)
+    sx2 = min(W, sx1 + side);   sy2 = min(H, sy1 + side)
+    # Guard against zero-area crops (face bbox at edge of image)
+    if sx2 - sx1 < 32 or sy2 - sy1 < 32:
+        raise RuntimeError("Face too close to image edge to crop safely")
     crop_bgr = target_bgr[sy1:sy2, sx1:sx2]
     ch, cw = crop_bgr.shape[:2]
+    if ch == 0 or cw == 0:
+        raise RuntimeError("Empty crop")
 
-    gen_size = 1024
-    crop_resized = cv2.resize(crop_bgr, (gen_size, gen_size), interpolation=cv2.INTER_LANCZOS4)
+    crop_resized = cv2.resize(crop_bgr, (GEN_SIZE, GEN_SIZE), interpolation=cv2.INTER_LANCZOS4)
     crop_pil = Image.fromarray(cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB))
 
     kps_in_crop = tgt_face.kps - np.array([sx1, sy1])
-    kps_scaled = kps_in_crop * np.array([gen_size/cw, gen_size/ch])
+    kps_scaled = kps_in_crop * np.array([GEN_SIZE/cw, GEN_SIZE/ch])
     kps_image = draw_kps(crop_pil, kps_scaled)
 
     best = None
     best_sim = -1.0
-    cur_ip = ip_scale
-    attempts_used = 0
+    cur_ip = IP_SCALE
 
-    for attempt in range(max_attempts):
-        attempts_used = attempt + 1
+    for attempt in range(MAX_ATTEMPTS):
         pipe.set_ip_adapter_scale(cur_ip)
         seed = int(time.time()*1000) % (2**31) + attempt*7919
         gen = torch.Generator(device="cuda").manual_seed(seed)
@@ -113,19 +131,23 @@ def swap_one(source_emb, target_path, ip_scale, cn_scale, steps, target_sim, max
             negative_prompt="cartoon, painting, 3d, plastic, smooth, airbrushed, blurry, lowres, deformed, ugly",
             image_embeds=torch.from_numpy(source_emb).unsqueeze(0),
             image=kps_image,
-            controlnet_conditioning_scale=cn_scale,
-            num_inference_steps=steps,
+            controlnet_conditioning_scale=CN_SCALE,
+            num_inference_steps=STEPS,
             guidance_scale=5.0,
-            width=gen_size, height=gen_size,
+            width=GEN_SIZE, height=GEN_SIZE,
             generator=gen,
         ).images[0]
         gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
         gf = face_app.get(gen_full)
-        sim = cosine_sim(source_emb, max(gf, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1])).normed_embedding) if gf else -1.0
+        if gf:
+            biggest = max(gf, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+            sim = cosine_sim(source_emb, biggest.normed_embedding)
+        else:
+            sim = -1.0
         if sim > best_sim:
             best_sim = sim
             best = gen_full
-        if sim >= target_sim:
+        if sim >= TARGET_SIM:
             break
         cur_ip = min(1.0, cur_ip + 0.05)
 
@@ -143,10 +165,10 @@ def swap_one(source_emb, target_path, ip_scale, cn_scale, steps, target_sim, max
     except cv2.error:
         soft = cv2.GaussianBlur(mask.astype(np.float32)/255.0, (0,0), 12)[..., np.newaxis]
         result_bgr[sy1:sy2, sx1:sx2] = (gen_bgr * soft + crop_orig * (1-soft)).astype(np.uint8)
-    return result_bgr, best_sim, attempts_used
+    return result_bgr, best_sim
 
 
-def swap_batch(source_img, target_files, ip_scale, cn_scale, steps, target_sim, max_attempts, progress=gr.Progress(track_tqdm=False)):
+def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False)):
     if source_img is None:
         return None, "Drop a source face first."
     if not target_files:
@@ -154,7 +176,7 @@ def swap_batch(source_img, target_files, ip_scale, cn_scale, steps, target_sim, 
     src_bgr = cv2.cvtColor(source_img, cv2.COLOR_RGB2BGR)
     src_face = biggest_face(src_bgr)
     if src_face is None:
-        return None, "No face detected in source."
+        return None, "No face detected in the source image. Try a clearer front-facing photo."
     source_emb = src_face.normed_embedding
 
     run_dir = OUTPUT_DIR / time.strftime("%Y%m%d_%H%M%S")
@@ -166,44 +188,40 @@ def swap_batch(source_img, target_files, ip_scale, cn_scale, steps, target_sim, 
         progress((i+1)/n, desc=f"Generating {i+1}/{n}")
         path = f if isinstance(f, str) else f.name
         try:
-            out_bgr, sim, attempts = swap_one(source_emb, path, ip_scale, cn_scale, int(steps), float(target_sim), int(max_attempts))
+            out_bgr, sim = swap_one(source_emb, path)
             sim_pct = max(0.0, sim) * 100
-            tag = "[GOOD]" if sim >= target_sim else "[WEAK]"
+            tag = "[GOOD]" if sim >= TARGET_SIM else "[WEAK]"
             stem = Path(path).stem
             out_path = run_dir / f"swap_{i:03d}_sim{int(sim_pct):02d}_{stem}.png"
             cv2.imwrite(str(out_path), out_bgr)
             results.append(str(out_path))
-            sim_log.append(f"{tag} {Path(path).name}: {sim_pct:.0f}% ({attempts} attempt{'s' if attempts > 1 else ''})")
+            sim_log.append(f"{tag} {Path(path).name}: {sim_pct:.0f}%")
         except Exception as e:
             failed.append(f"{Path(path).name}: {e}")
 
-    sims = [float(line.split(': ')[1].split('%')[0]) for line in sim_log]
-    avg = sum(sims)/len(sims) if sims else 0
-    msg = f"Done: {len(results)} swapped to {run_dir}\n\n**Avg identity match: {avg:.0f}%**\n\n" + "\n".join(sim_log[:20])
+    if sim_log:
+        sims = [float(line.split(': ')[1].split('%')[0]) for line in sim_log]
+        avg = sum(sims) / len(sims)
+        msg = f"Done: {len(results)} swapped → {run_dir}\n\n**Avg identity match: {avg:.0f}%**\n\n" + "\n".join(sim_log[:20])
+    else:
+        msg = "No images were successfully swapped."
     if failed:
-        msg += "\n\nSkipped: " + "; ".join(failed[:5])
+        msg += "\n\nSkipped:\n" + "\n".join(failed[:10])
     return results, msg
 
 
-with gr.Blocks(title="Easy Face Swap (Cloud)", theme=gr.themes.Soft()) as demo:
-    gr.Markdown("# Easy Face Swap — Cloud (InstantID + RealVisXL)")
-    gr.Markdown("Drop source → drop targets → Swap All. Outputs at `/workspace/outputs/`.")
+with gr.Blocks(title="Easy Face Swap (Cloud)") as demo:
+    gr.Markdown("# Easy Face Swap — Cloud")
+    gr.Markdown("Drop your source face on the left, drop target images on the right, hit **Swap All**.")
     with gr.Row():
         with gr.Column():
             source = gr.Image(label="Source face", type="numpy", height=400)
         with gr.Column():
             targets = gr.Files(label="Target images", file_types=["image"], file_count="multiple")
-    with gr.Row():
-        ip_scale = gr.Slider(0.6, 1.0, value=0.85, step=0.05, label="Identity strength")
-        cn_scale = gr.Slider(0.5, 1.0, value=0.85, step=0.05, label="Pose lock")
-        steps = gr.Slider(15, 35, value=22, step=1, label="Quality steps")
-    with gr.Row():
-        target_sim = gr.Slider(0.0, 0.95, value=0.65, step=0.05, label="Target identity match")
-        max_attempts = gr.Slider(1, 4, value=2, step=1, label="Max retries")
-    btn = gr.Button("Swap All", variant="primary")
+    btn = gr.Button("Swap All", variant="primary", size="lg")
     status = gr.Markdown("")
     gallery = gr.Gallery(label="Results", columns=3, height=600)
-    btn.click(swap_batch, [source, targets, ip_scale, cn_scale, steps, target_sim, max_attempts], [gallery, status])
+    btn.click(swap_batch, [source, targets], [gallery, status])
 
 
 if __name__ == "__main__":
