@@ -22,25 +22,33 @@ pip install -q insightface onnxruntime-gpu 'opencv-python<5' einops 'numpy<2'
 echo "--- versions ---"
 python -c "import gradio, huggingface_hub, diffusers, transformers, peft, torch; print(f'gradio={gradio.__version__} hf_hub={huggingface_hub.__version__} diffusers={diffusers.__version__} transformers={transformers.__version__} peft={peft.__version__} torch={torch.__version__} cuda={torch.cuda.is_available()}')"
 
-echo "--- antelopev2 face model ---"
-INSIGHTFACE_DIR=/root/.insightface/models/antelopev2
-if [ ! -f "$INSIGHTFACE_DIR/glintr100.onnx" ]; then
-  mkdir -p /root/.insightface/models
+echo "--- antelopev2 face model (cached on persistent volume) ---"
+# Cache the model on the persistent volume so it survives pod stops/restarts.
+PERSIST_DIR=/workspace/insightface_models/antelopev2
+mkdir -p /workspace/insightface_models
+mkdir -p /root/.insightface/models
+# Symlink antelopev2 under the path insightface expects.
+rm -rf /root/.insightface/models/antelopev2
+ln -sfn "$PERSIST_DIR" /root/.insightface/models/antelopev2
+
+if [ ! -f "$PERSIST_DIR/glintr100.onnx" ]; then
+  mkdir -p "$PERSIST_DIR"
   cd /tmp
   echo "Downloading antelopev2 zip..."
   wget -q --show-progress -O antelopev2.zip "https://huggingface.co/MonsterMMORPG/tools/resolve/main/antelopev2.zip" || \
   wget -q --show-progress -O antelopev2.zip "https://huggingface.co/DIAMONIK7777/antelopev2/resolve/main/antelopev2.zip"
-  echo "Unzipping..."
-  unzip -q -o antelopev2.zip -d /root/.insightface/models/
-  # Some zips nest antelopev2 inside antelopev2/ - flatten if so
-  if [ -d "$INSIGHTFACE_DIR/antelopev2" ]; then
-    mv "$INSIGHTFACE_DIR/antelopev2"/* "$INSIGHTFACE_DIR/"
-    rmdir "$INSIGHTFACE_DIR/antelopev2"
+  unzip -q -o antelopev2.zip -d /tmp/antelopev2_extract
+  # Models may live in either /tmp/antelopev2_extract/antelopev2/ or directly in /tmp/antelopev2_extract/
+  if [ -d /tmp/antelopev2_extract/antelopev2 ]; then
+    mv /tmp/antelopev2_extract/antelopev2/* "$PERSIST_DIR/"
+  else
+    mv /tmp/antelopev2_extract/* "$PERSIST_DIR/"
   fi
-  rm antelopev2.zip
-  ls -la "$INSIGHTFACE_DIR/"
+  rm -rf /tmp/antelopev2.zip /tmp/antelopev2_extract
+  ls -la "$PERSIST_DIR/"
+else
+  echo "antelopev2 already cached."
 fi
-echo "antelopev2 ready."
 
 echo "--- clone InstantID pipeline ---"
 if [ ! -d /workspace/InstantID ]; then
