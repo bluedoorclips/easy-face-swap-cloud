@@ -16,12 +16,15 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
 
 echo "--- pip install ---"
 pip install -q -U pip
-# gradio 5+ avoids the old HfFolder import. Pin numpy<2 for opencv/insightface compatibility.
-pip install -q -U 'gradio>=5,<6' 'huggingface_hub>=0.26' diffusers transformers accelerate peft \
-    insightface onnxruntime-gpu 'opencv-python<5' einops 'numpy<2'
+# Pin transformers/diffusers/peft to versions that work with torch 2.4 + InstantID.
+# transformers 4.50+ uses torch.library APIs only in torch 2.5+; diffusers 0.38+ pulls in peft 0.18 which depends on those.
+# These pins are the known-good combo for InstantID + RealVisXL on torch 2.4.
+pip install -q -U 'gradio>=5,<6' 'huggingface_hub>=0.26'
+pip install -q 'transformers==4.46.3' 'diffusers==0.31.0' 'peft==0.13.2' 'accelerate==1.1.1'
+pip install -q insightface onnxruntime-gpu 'opencv-python<5' einops 'numpy<2'
 
 echo "--- versions ---"
-python -c "import gradio, huggingface_hub, diffusers, torch; print(f'gradio={gradio.__version__} hf_hub={huggingface_hub.__version__} diffusers={diffusers.__version__} torch={torch.__version__} cuda={torch.cuda.is_available()}')"
+python -c "import gradio, huggingface_hub, diffusers, transformers, peft, torch; print(f'gradio={gradio.__version__} hf_hub={huggingface_hub.__version__} diffusers={diffusers.__version__} transformers={transformers.__version__} peft={peft.__version__} torch={torch.__version__} cuda={torch.cuda.is_available()}')"
 
 echo "--- clone InstantID pipeline ---"
 if [ ! -d /workspace/InstantID ]; then
