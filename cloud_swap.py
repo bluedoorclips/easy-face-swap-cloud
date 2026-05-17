@@ -1,9 +1,9 @@
 """
 Easy Face Swap — cloud edition.
 Tab 1: Swap (InstantID img2img + optional character LoRA)
-Tab 2: Train Character (DreamBooth-LoRA SDXL via subprocess)
+Tab 2: Train Character (Stage photos + Train LoRA)
 
-API supports overnight batch training:
+API for batch training:
   stage_character(name, photos) -> upload photos, returns fast
   train_character(name, photos, max_steps) -> trains; if photos empty, reuses staged
 """
@@ -341,8 +341,6 @@ def refresh_lora_list():
     return gr.update(choices=["(none)"] + list_loras(), value="(none)")
 
 
-# ---- Training endpoints ----
-
 def stage_character(character_name, photos):
     """Upload photos for a character. Fast - just saves files. No training."""
     name = (character_name or "").strip().lower()
@@ -376,7 +374,6 @@ def train_character(character_name, photos, max_steps, progress=gr.Progress(trac
     images_dir = TRAINING_DIR / name / "images"
 
     if photos:
-        # Restage with provided photos
         if images_dir.exists():
             shutil.rmtree(images_dir)
         images_dir.mkdir(parents=True)
@@ -446,13 +443,16 @@ with gr.Blocks(title="Easy Face Swap (Cloud)") as demo:
         btn.click(swap_batch, [source, source_extras, targets, character_lora], [gallery, status])
         refresh_btn.click(refresh_lora_list, [], [character_lora])
     with gr.Tab("Train Character"):
-        gr.Markdown("**Train a character LoRA.** Pick a short name (e.g. `baileyy`), drop 15-50 clear face photos, click Train. Takes ~30-40 min on the GPU.")
+        gr.Markdown("**Train a character LoRA.** Pick a short name (e.g. `baileyy`), drop 15-50 clear face photos.")
         train_name = gr.Textbox(label="Character name (lowercase, alphanumeric)", placeholder="e.g. baileyy")
         train_photos = gr.Files(label="Training photos (15-50)", file_types=["image"], file_count="multiple")
         train_steps = gr.Slider(label="Training steps", minimum=400, maximum=2000, value=1200, step=100)
-        train_btn = gr.Button("Train LoRA", variant="primary", size="lg")
+        with gr.Row():
+            stage_btn = gr.Button("Stage photos only (fast)")
+            train_btn = gr.Button("Train LoRA (30-40 min)", variant="primary")
         train_log = gr.Markdown("")
-        train_btn.click(train_character, [train_name, train_photos, train_steps], [train_log])
+        stage_btn.click(stage_character, [train_name, train_photos], [train_log], api_name="stage_character")
+        train_btn.click(train_character, [train_name, train_photos, train_steps], [train_log], api_name="train_character")
     with gr.Tab("Status"):
         status_btn = gr.Button("Refresh status")
         status_md = gr.Markdown(show_status())
@@ -460,19 +460,9 @@ with gr.Blocks(title="Easy Face Swap (Cloud)") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(
+    demo.queue().launch(
         server_name="0.0.0.0",
         server_port=7860,
         show_error=True,
         allowed_paths=[str(OUTPUT_DIR)],
     )
-
-
-# Expose stage_character as a named endpoint via Blocks API hack
-# (Gradio 5 auto-discovers functions used in .click; for API-only functions
-# we use api_name in a hidden Interface.)
-# Actually we need it discoverable - register a tiny Interface alongside.
-_stage_iface = gr.Interface(fn=stage_character,
-                            inputs=[gr.Textbox(label="name"), gr.Files(label="photos", file_count="multiple")],
-                            outputs=gr.Textbox(label="result"),
-                            api_name="stage_character")
