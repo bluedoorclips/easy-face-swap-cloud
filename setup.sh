@@ -1,6 +1,6 @@
 #!/bin/bash
-# RunPod boot script: install deps, fetch helper repo, launch Gradio on 7860.
-# Output is teed to /workspace/boot.log so you can debug crashes.
+# RunPod boot script: install deps, launch Gradio on 7860.
+# Output is teed to /workspace/boot.log so we can debug crashes.
 set -e
 LOG=/workspace/boot.log
 exec > >(tee -a "$LOG") 2>&1
@@ -16,8 +16,12 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
 
 echo "--- pip install ---"
 pip install -q -U pip
-pip install -q diffusers transformers accelerate peft 'gradio<5' \
-    insightface onnxruntime-gpu 'opencv-python<5' huggingface_hub einops 'numpy<2'
+# gradio 5+ avoids the old HfFolder import. Pin numpy<2 for opencv/insightface compatibility.
+pip install -q -U 'gradio>=5,<6' 'huggingface_hub>=0.26' diffusers transformers accelerate peft \
+    insightface onnxruntime-gpu 'opencv-python<5' einops 'numpy<2'
+
+echo "--- versions ---"
+python -c "import gradio, huggingface_hub, diffusers, torch; print(f'gradio={gradio.__version__} hf_hub={huggingface_hub.__version__} diffusers={diffusers.__version__} torch={torch.__version__} cuda={torch.cuda.is_available()}')"
 
 echo "--- clone InstantID pipeline ---"
 if [ ! -d /workspace/InstantID ]; then
