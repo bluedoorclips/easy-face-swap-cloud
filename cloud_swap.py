@@ -1,5 +1,7 @@
 """
-Easy Face Swap — cloud edition. InstantID img2img + Poisson blend back into the full target.
+Easy Face Swap — cloud edition.
+Pipeline: InstantID img2img (face replacement) → optional face-detail refinement pass → Poisson blend.
+Supports averaging identity across 1-5 source photos for tighter character consistency.
 """
 import os, sys, time, traceback
 from pathlib import Path
@@ -14,6 +16,7 @@ import gradio as gr
 from insightface.app import FaceAnalysis
 from huggingface_hub import snapshot_download
 from diffusers.models import ControlNetModel
+from diffusers import StableDiffusionXLImg2ImgPipeline
 
 try:
     import pillow_heif
@@ -29,42 +32,48 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DTYPE = torch.float16
 
+# Base model — Juggernaut XL v9 is a community-favourite photoreal SDXL fine-tune.
+BASE_MODEL    = "RunDiffusion/Juggernaut-XL-v9"
+
 IP_SCALE      = 0.85
 CN_SCALE      = 0.80
-STRENGTH      = 0.60   # lower = preserve more of target context
+STRENGTH      = 0.60
 STEPS         = 32
-GUIDANCE      = 2.5    # very low CFG = lets model output a more natural distribution
+GUIDANCE      = 3.0
+REFINE_STRENGTH = 0.18   # detail refinement pass — tiny denoise to recover micro-detail
+REFINE_STEPS    = 10
 TARGET_SIM    = 0.55
 MAX_ATTEMPTS  = 2
 GEN_SIZE      = 1024
 MAX_INPUT_DIM = 2048
 CROP_PAD      = 1.35
 
-# Neutral prompts — no specific facial-feature requests so the IP-Adapter alone
-# decides what skin features (freckles, etc.) the source person actually has.
 PROMPT = (
     "candid photograph, natural soft lighting, sharp focus, high resolution, film grain"
+)
+REFINE_PROMPT = (
+    "detailed skin pores, eyelash detail, fine eyebrow hairs, natural skin texture, "
+    "candid photograph, sharp focus, film grain"
 )
 NEG_PROMPT = (
     "AI generated, CGI, 3d render, plastic skin, airbrushed, doll face, perfect symmetry, "
     "glossy, cartoon, illustration, painting, deformed, ugly, blurry, lowres, "
-    "beauty filter, instagram filter, fake, oversaturated, posterized, "
-    "too many freckles, exaggerated freckles, freckle overlay"
+    "beauty filter, instagram filter, fake, oversaturated, posterized"
 )
 
 print("=" * 60)
 print("Easy Face Swap (cloud) — loading...")
 print("=" * 60)
 
-print("[1/2] Face analyzer (antelopev2)...")
+print("[1/3] Face analyzer (antelopev2)...")
 face_app = FaceAnalysis(name="antelopev2", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
 face_app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.3)
 
-print("[2/2] InstantID img2img + RealVisXL...")
+print(f"[2/3] InstantID img2img on {BASE_MODEL}...")
 instantid_dir = snapshot_download("InstantX/InstantID", allow_patterns=["ControlNetModel/*", "ip-adapter.bin"])
 controlnet = ControlNetModel.from_pretrained(os.path.join(instantid_dir, "ControlNetModel"), torch_dtype=DTYPE)
 pipe = StableDiffusionXLInstantIDImg2ImgPipeline.from_pretrained(
-    "SG161222/RealVisXL_V4.0", controlnet=controlnet, torch_dtype=DTYPE,
+    BASE_MODEL, controlnet=controlnet, torch_dtype=DTYPE,
     variant="fp16", use_safetensors=True,
 )
 pipe.load_ip_adapter_instantid(os.path.join(instantid_dir, "ip-adapter.bin"))
@@ -76,6 +85,20 @@ if vram_gb >= 20:
 else:
     pipe.enable_model_cpu_offload(); pipe.enable_vae_tiling(); pipe.enable_vae_slicing()
 pipe.set_progress_bar_config(disable=True)
+
+print(f"[3/3] Detail refiner (SDXL img2img, same base)...")
+# Share text encoder/vae/unet with the main pipe to save VRAM
+refiner = StableDiffusionXLImg2ImgPipeline(
+    vae=pipe.vae,
+    text_encoder=pipe.text_encoder,
+    text_encoder_2=pipe.text_encoder_2,
+    tokenizer=pipe.tokenizer,
+    tokenizer_2=pipe.tokenizer_2,
+    unet=pipe.unet,
+    scheduler=pipe.scheduler,
+)
+refiner.set_progress_bar_config(disable=True)
+
 print("Ready.")
 
 
@@ -128,7 +151,27 @@ def biggest_face(img_bgr):
     return max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1])) if faces else None
 
 
-def swap_one(source_emb, target_path):
+def compute_source_embedding(source_images):
+    """Take a list of np.ndarray (RGB from Gradio) source faces and return averaged embedding.
+    Skips images where no face is detected."""
+    embs = []
+    for img_rgb in source_images:
+        if img_rgb is None:
+            continue
+        try:
+            bgr = normalize_image(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR))
+            face = biggest_face(bgr)
+            if face is not None:
+                embs.append(face.embedding)
+        except Exception as e:
+            print(f"[source-skip] {e}", flush=True)
+    if not embs:
+        return None
+    avg = np.mean(np.stack(embs, axis=0), axis=0)
+    return avg
+
+
+def swap_one(source_emb, target_path, do_refine=True):
     try:
         target_bgr = load_image_bgr(target_path)
     except Exception as e:
@@ -210,6 +253,24 @@ def swap_one(source_emb, target_path):
     if best is None or best.size == 0:
         raise RuntimeError("[step:diffuse] all attempts produced empty results")
 
+    # Detail-refinement pass: tiny denoise to put micro-detail back into the face
+    if do_refine:
+        try:
+            best_pil = Image.fromarray(cv2.cvtColor(best, cv2.COLOR_BGR2RGB))
+            gen2 = torch.Generator(device="cuda").manual_seed(int(time.time()*1000) % (2**31))
+            refined = refiner(
+                prompt=REFINE_PROMPT,
+                negative_prompt=NEG_PROMPT,
+                image=best_pil,
+                strength=REFINE_STRENGTH,
+                num_inference_steps=REFINE_STEPS,
+                guidance_scale=4.0,
+                generator=gen2,
+            ).images[0]
+            best = cv2.cvtColor(np.array(refined), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            print(f"[step:refine-skip] {type(e).__name__}: {e}", flush=True)
+
     try:
         gen_bgr = cv2.resize(best, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
         result_bgr = target_bgr.copy()
@@ -228,19 +289,28 @@ def swap_one(source_emb, target_path):
         raise RuntimeError(f"[step:composite] {type(e).__name__}: {e}")
 
 
-def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False)):
-    if source_img is None:
+def swap_batch(source_img, source_extras, target_files, progress=gr.Progress(track_tqdm=False)):
+    sources = [source_img]
+    if source_extras:
+        for f in source_extras:
+            path = f if isinstance(f, str) else f.name
+            try:
+                img_bgr = load_image_bgr(path)
+                sources.append(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            except Exception as e:
+                print(f"[extra-source-skip] {path}: {e}", flush=True)
+
+    if not any(s is not None for s in sources):
         return None, "Drop a source face first."
     if not target_files:
         return None, "Drop at least one target."
+
     try:
-        src_bgr = normalize_image(cv2.cvtColor(source_img, cv2.COLOR_RGB2BGR))
-        src_face = biggest_face(src_bgr)
+        source_emb = compute_source_embedding(sources)
     except Exception as e:
         return None, f"Source image error: {e}"
-    if src_face is None:
-        return None, "No face detected in the source image. Try a clearer front-facing photo."
-    source_emb = src_face.embedding
+    if source_emb is None:
+        return None, "No face detected in any source image. Try clearer front-facing photos."
 
     run_dir = OUTPUT_DIR / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(exist_ok=True)
@@ -266,7 +336,8 @@ def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False))
     if sim_log:
         sims = [float(line.split(': ')[1].split('%')[0]) for line in sim_log]
         avg = sum(sims) / len(sims)
-        msg = f"Done: {len(results)} swapped to {run_dir}\n\nAvg identity match: {avg:.0f}%\n\n" + "\n".join(sim_log[:20])
+        n_src = sum(1 for s in sources if s is not None)
+        msg = f"Done: {len(results)} swapped to {run_dir}\n\nSources used: {n_src}\nAvg identity match: {avg:.0f}%\n\n" + "\n".join(sim_log[:20])
     else:
         msg = "No images were successfully swapped."
     if failed:
@@ -276,16 +347,17 @@ def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False))
 
 with gr.Blocks(title="Easy Face Swap (Cloud)") as demo:
     gr.Markdown("# Easy Face Swap")
-    gr.Markdown("Drop source face on the left, target images on the right, hit **Swap All**.")
+    gr.Markdown("Drop a source face, drop targets, hit **Swap All**. *Optional: add 1-4 extra source photos for tighter identity match.*")
     with gr.Row():
         with gr.Column():
-            source = gr.Image(label="Source face", type="numpy", height=400)
+            source = gr.Image(label="Source face (main)", type="numpy", height=320)
+            source_extras = gr.Files(label="Extra source photos (optional, up to 4)", file_types=["image"], file_count="multiple")
         with gr.Column():
             targets = gr.Files(label="Target images", file_types=["image"], file_count="multiple")
     btn = gr.Button("Swap All", variant="primary", size="lg")
     status = gr.Markdown("")
     gallery = gr.Gallery(label="Results", columns=3, height=600)
-    btn.click(swap_batch, [source, targets], [gallery, status])
+    btn.click(swap_batch, [source, source_extras, targets], [gallery, status])
 
 
 if __name__ == "__main__":
