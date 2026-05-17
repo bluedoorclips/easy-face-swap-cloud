@@ -1,7 +1,6 @@
 """
 Easy Face Swap — cloud edition.
-Pipeline: InstantID img2img (face replacement) → optional face-detail refinement pass → Poisson blend.
-Supports averaging identity across 1-5 source photos for tighter character consistency.
+InstantID img2img on RealVisXL_V4.0 + multi-source identity averaging + Poisson blend.
 """
 import os, sys, time, traceback
 from pathlib import Path
@@ -16,7 +15,6 @@ import gradio as gr
 from insightface.app import FaceAnalysis
 from huggingface_hub import snapshot_download
 from diffusers.models import ControlNetModel
-from diffusers import StableDiffusionXLImg2ImgPipeline
 
 try:
     import pillow_heif
@@ -31,17 +29,13 @@ OUTPUT_DIR = Path("/workspace/outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DTYPE = torch.float16
-
-# Base model — Juggernaut XL v9 is a community-favourite photoreal SDXL fine-tune.
-BASE_MODEL    = "RunDiffusion/Juggernaut-XL-v9"
+BASE_MODEL    = "SG161222/RealVisXL_V4.0"
 
 IP_SCALE      = 0.85
 CN_SCALE      = 0.80
 STRENGTH      = 0.60
 STEPS         = 32
-GUIDANCE      = 3.0
-REFINE_STRENGTH = 0.18   # detail refinement pass — tiny denoise to recover micro-detail
-REFINE_STEPS    = 10
+GUIDANCE      = 2.5
 TARGET_SIM    = 0.55
 MAX_ATTEMPTS  = 2
 GEN_SIZE      = 1024
@@ -50,10 +44,6 @@ CROP_PAD      = 1.35
 
 PROMPT = (
     "candid photograph, natural soft lighting, sharp focus, high resolution, film grain"
-)
-REFINE_PROMPT = (
-    "detailed skin pores, eyelash detail, fine eyebrow hairs, natural skin texture, "
-    "candid photograph, sharp focus, film grain"
 )
 NEG_PROMPT = (
     "AI generated, CGI, 3d render, plastic skin, airbrushed, doll face, perfect symmetry, "
@@ -65,11 +55,11 @@ print("=" * 60)
 print("Easy Face Swap (cloud) — loading...")
 print("=" * 60)
 
-print("[1/3] Face analyzer (antelopev2)...")
+print("[1/2] Face analyzer (antelopev2)...")
 face_app = FaceAnalysis(name="antelopev2", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
 face_app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.3)
 
-print(f"[2/3] InstantID img2img on {BASE_MODEL}...")
+print(f"[2/2] InstantID img2img on {BASE_MODEL}...")
 instantid_dir = snapshot_download("InstantX/InstantID", allow_patterns=["ControlNetModel/*", "ip-adapter.bin"])
 controlnet = ControlNetModel.from_pretrained(os.path.join(instantid_dir, "ControlNetModel"), torch_dtype=DTYPE)
 pipe = StableDiffusionXLInstantIDImg2ImgPipeline.from_pretrained(
@@ -85,20 +75,6 @@ if vram_gb >= 20:
 else:
     pipe.enable_model_cpu_offload(); pipe.enable_vae_tiling(); pipe.enable_vae_slicing()
 pipe.set_progress_bar_config(disable=True)
-
-print(f"[3/3] Detail refiner (SDXL img2img, same base)...")
-# Share text encoder/vae/unet with the main pipe to save VRAM
-refiner = StableDiffusionXLImg2ImgPipeline(
-    vae=pipe.vae,
-    text_encoder=pipe.text_encoder,
-    text_encoder_2=pipe.text_encoder_2,
-    tokenizer=pipe.tokenizer,
-    tokenizer_2=pipe.tokenizer_2,
-    unet=pipe.unet,
-    scheduler=pipe.scheduler,
-)
-refiner.set_progress_bar_config(disable=True)
-
 print("Ready.")
 
 
@@ -152,8 +128,7 @@ def biggest_face(img_bgr):
 
 
 def compute_source_embedding(source_images):
-    """Take a list of np.ndarray (RGB from Gradio) source faces and return averaged embedding.
-    Skips images where no face is detected."""
+    """Take a list of np.ndarray (RGB) source faces and return averaged embedding."""
     embs = []
     for img_rgb in source_images:
         if img_rgb is None:
@@ -167,11 +142,10 @@ def compute_source_embedding(source_images):
             print(f"[source-skip] {e}", flush=True)
     if not embs:
         return None
-    avg = np.mean(np.stack(embs, axis=0), axis=0)
-    return avg
+    return np.mean(np.stack(embs, axis=0), axis=0)
 
 
-def swap_one(source_emb, target_path, do_refine=True):
+def swap_one(source_emb, target_path):
     try:
         target_bgr = load_image_bgr(target_path)
     except Exception as e:
@@ -252,24 +226,6 @@ def swap_one(source_emb, target_path, do_refine=True):
 
     if best is None or best.size == 0:
         raise RuntimeError("[step:diffuse] all attempts produced empty results")
-
-    # Detail-refinement pass: tiny denoise to put micro-detail back into the face
-    if do_refine:
-        try:
-            best_pil = Image.fromarray(cv2.cvtColor(best, cv2.COLOR_BGR2RGB))
-            gen2 = torch.Generator(device="cuda").manual_seed(int(time.time()*1000) % (2**31))
-            refined = refiner(
-                prompt=REFINE_PROMPT,
-                negative_prompt=NEG_PROMPT,
-                image=best_pil,
-                strength=REFINE_STRENGTH,
-                num_inference_steps=REFINE_STEPS,
-                guidance_scale=4.0,
-                generator=gen2,
-            ).images[0]
-            best = cv2.cvtColor(np.array(refined), cv2.COLOR_RGB2BGR)
-        except Exception as e:
-            print(f"[step:refine-skip] {type(e).__name__}: {e}", flush=True)
 
     try:
         gen_bgr = cv2.resize(best, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
