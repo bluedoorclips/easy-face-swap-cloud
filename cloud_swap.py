@@ -106,7 +106,6 @@ def biggest_face(img_bgr):
 
 
 def swap_one(source_emb, target_path):
-    # Each step wrapped — error message will say which one died
     try:
         target_bgr = load_image_bgr(target_path)
     except Exception as e:
@@ -142,7 +141,9 @@ def swap_one(source_emb, target_path):
     except Exception as e:
         raise RuntimeError(f"[step:crop+kps] {type(e).__name__}: {e}")
 
-    best = None; best_sim = -1.0; cur_ip = IP_SCALE
+    best = None
+    best_sim = -1.0
+    cur_ip = IP_SCALE
 
     for attempt in range(MAX_ATTEMPTS):
         try:
@@ -159,10 +160,15 @@ def swap_one(source_emb, target_path):
                 num_inference_steps=STEPS, guidance_scale=5.0,
                 width=GEN_SIZE, height=GEN_SIZE, generator=gen,
             ).images[0]
+            gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
+            print(f"[attempt {attempt}] gen shape: {gen_full.shape} dtype: {gen_full.dtype}", flush=True)
+            # Always keep the latest generated image; sim scoring just decides if we retry
+            if best is None or best.size == 0:
+                best = gen_full
         except Exception as e:
             raise RuntimeError(f"[step:diffuse attempt={attempt}] {type(e).__name__}: {e}")
+
         try:
-            gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
             gf = face_app.get(gen_full)
             if gf:
                 biggest = max(gf, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
@@ -170,14 +176,20 @@ def swap_one(source_emb, target_path):
             else:
                 sim = -1.0
             if sim > best_sim:
-                best_sim = sim; best = gen_full
+                best_sim = sim
+                best = gen_full
             if sim >= TARGET_SIM:
                 break
             cur_ip = min(1.0, cur_ip + 0.05)
         except Exception as e:
-            raise RuntimeError(f"[step:score attempt={attempt}] {type(e).__name__}: {e}")
+            # Don't fail composite if scoring fails — we still have gen_full as best
+            print(f"[score attempt={attempt}] {type(e).__name__}: {e}", flush=True)
+
+    if best is None or best.size == 0:
+        raise RuntimeError("[step:diffuse] all attempts produced empty results")
 
     try:
+        print(f"[composite] best.shape={best.shape}, target_crop=({cw},{ch}) target_full=({W},{H})", flush=True)
         gen_bgr = cv2.resize(best, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
         mask = np.zeros((ch, cw), dtype=np.uint8)
         cv2.ellipse(mask, (cw//2, ch//2), (int(cw*0.40), int(ch*0.46)), 0, 0, 360, 255, -1)
@@ -192,7 +204,7 @@ def swap_one(source_emb, target_path):
             result_bgr[sy1:sy2, sx1:sx2] = (gen_bgr * soft + crop_orig * (1-soft)).astype(np.uint8)
         return result_bgr, best_sim
     except Exception as e:
-        raise RuntimeError(f"[step:composite] {type(e).__name__}: {e}")
+        raise RuntimeError(f"[step:composite] {type(e).__name__}: {e} (best.shape={getattr(best,'shape','?')}, crop=({cw},{ch}))")
 
 
 def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False)):
