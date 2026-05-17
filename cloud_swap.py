@@ -31,24 +31,25 @@ DTYPE = torch.float16
 
 IP_SCALE      = 0.85
 CN_SCALE      = 0.80
-STRENGTH      = 0.65   # keep more of target lighting/colour
+STRENGTH      = 0.60   # lower = preserve more of target context
 STEPS         = 32
-GUIDANCE      = 3.2    # softer = less plastic AI-perfect look
+GUIDANCE      = 2.5    # very low CFG = lets model output a more natural distribution
 TARGET_SIM    = 0.55
 MAX_ATTEMPTS  = 2
 GEN_SIZE      = 1024
 MAX_INPUT_DIM = 2048
-CROP_PAD      = 1.35   # extra skin context for Poisson blend to work with
+CROP_PAD      = 1.35
 
+# Neutral prompts — no specific facial-feature requests so the IP-Adapter alone
+# decides what skin features (freckles, etc.) the source person actually has.
 PROMPT = (
-    "raw candid iPhone photo of a real person, natural unretouched skin, visible pores and freckles, "
-    "fine skin texture with slight asymmetry, soft natural lighting, photojournalism, sharp focus, "
-    "depth of field, film grain"
+    "candid photograph, natural soft lighting, sharp focus, high resolution, film grain"
 )
 NEG_PROMPT = (
-    "AI generated, CGI, 3d render, plastic skin, smooth skin, airbrushed, doll face, perfect symmetry, "
+    "AI generated, CGI, 3d render, plastic skin, airbrushed, doll face, perfect symmetry, "
     "glossy, cartoon, illustration, painting, deformed, ugly, blurry, lowres, "
-    "makeup-heavy, beauty filter, instagram filter, fake, posterized"
+    "beauty filter, instagram filter, fake, oversaturated, posterized, "
+    "too many freckles, exaggerated freckles, freckle overlay"
 )
 
 print("=" * 60)
@@ -213,8 +214,6 @@ def swap_one(source_emb, target_path):
         gen_bgr = cv2.resize(best, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
         result_bgr = target_bgr.copy()
         crop_orig = result_bgr[sy1:sy2, sx1:sx2].copy()
-        # Generous elliptical mask covering the face + a bit of surround.
-        # cv2.seamlessClone uses Poisson blending to match the gradient — boundary disappears.
         mask = np.zeros((ch, cw), dtype=np.uint8)
         cv2.ellipse(mask, (cw//2, ch//2), (int(cw*0.42), int(ch*0.48)), 0, 0, 360, 255, -1)
         mask = cv2.erode(mask, np.ones((5,5), np.uint8), iterations=2)
