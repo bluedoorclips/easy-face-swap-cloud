@@ -15,6 +15,13 @@ from insightface.app import FaceAnalysis
 from huggingface_hub import snapshot_download
 from diffusers.models import ControlNetModel
 
+# pillow-heif registers HEIC/HEIF support into PIL globally if installed
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+except Exception:
+    pass
+
 from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline, draw_kps
 
 OUTPUT_DIR = Path("/workspace/outputs")
@@ -23,12 +30,13 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 DTYPE = torch.float16
 
 # Tuned defaults — hardcoded so the UI stays drag-drop only.
-IP_SCALE       = 0.85   # identity strength
-CN_SCALE       = 0.85   # controlnet pose lock
-STEPS          = 22     # diffusion quality steps
-TARGET_SIM     = 0.65   # auto-retry until match is at least this good (cosine sim)
-MAX_ATTEMPTS   = 2      # max retries per image if first attempt is weak
-GEN_SIZE       = 1024
+IP_SCALE      = 0.85
+CN_SCALE      = 0.85
+STEPS         = 22
+TARGET_SIM    = 0.65
+MAX_ATTEMPTS  = 2
+GEN_SIZE      = 1024
+MAX_INPUT_DIM = 2048   # downscale anything larger before face detection
 
 print("=" * 60)
 print("Easy Face Swap (cloud) — loading...")
@@ -62,17 +70,38 @@ pipe.set_progress_bar_config(disable=True)
 print("Ready.")
 
 
+def normalize_image(img):
+    """Force 3-channel uint8 BGR with sane dimensions for downstream cv2/insightface."""
+    if img is None or img.size == 0:
+        raise RuntimeError("Empty image")
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.ndim == 3 and img.shape[2] == 4:
+        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    elif img.ndim == 3 and img.shape[2] != 3:
+        raise RuntimeError(f"Unsupported image shape: {img.shape}")
+    h, w = img.shape[:2]
+    if max(h, w) > MAX_INPUT_DIM:
+        scale = MAX_INPUT_DIM / max(h, w)
+        img = cv2.resize(img, (max(1, int(w*scale)), max(1, int(h*scale))), interpolation=cv2.INTER_AREA)
+    elif min(h, w) < 64:
+        raise RuntimeError(f"Image too small: {w}x{h}")
+    return img
+
+
 def load_image_bgr(path):
-    """Read an image to BGR ndarray. cv2.imread fails on HEIC/exotic JPGs; fall back to PIL."""
+    """Robust loader: cv2.imread → fall back to PIL (with HEIC support) → normalize."""
     img = cv2.imread(path)
-    if img is not None and img.size > 0:
-        return img
-    try:
-        with Image.open(path) as pil:
-            pil = ImageOps.exif_transpose(pil).convert("RGB")
-            return cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
-    except Exception as e:
-        raise RuntimeError(f"Couldn't read image: {e}")
+    if img is None or img.size == 0:
+        try:
+            with Image.open(path) as pil:
+                pil = ImageOps.exif_transpose(pil).convert("RGB")
+                img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            raise RuntimeError(f"Couldn't decode image: {e}")
+    return normalize_image(img)
 
 
 def cosine_sim(a, b):
@@ -80,11 +109,16 @@ def cosine_sim(a, b):
 
 
 def biggest_face(img_bgr):
-    faces = face_app.get(img_bgr)
-    if not faces:
-        face_app.prepare(ctx_id=0, det_size=(1024, 1024), det_thresh=0.2)
+    try:
         faces = face_app.get(img_bgr)
-        face_app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.3)
+    except Exception as e:
+        raise RuntimeError(f"Face detector error: {e}")
+    if not faces:
+        try:
+            face_app.prepare(ctx_id=0, det_size=(1024, 1024), det_thresh=0.2)
+            faces = face_app.get(img_bgr)
+        finally:
+            face_app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.3)
     return max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1])) if faces else None
 
 
@@ -102,13 +136,10 @@ def swap_one(source_emb, target_path):
     side = side if side % 2 == 0 else side + 1
     sx1 = max(0, cx - side//2); sy1 = max(0, cy - side//2)
     sx2 = min(W, sx1 + side);   sy2 = min(H, sy1 + side)
-    # Guard against zero-area crops (face bbox at edge of image)
-    if sx2 - sx1 < 32 or sy2 - sy1 < 32:
+    if sx2 - sx1 < 64 or sy2 - sy1 < 64:
         raise RuntimeError("Face too close to image edge to crop safely")
     crop_bgr = target_bgr[sy1:sy2, sx1:sx2]
     ch, cw = crop_bgr.shape[:2]
-    if ch == 0 or cw == 0:
-        raise RuntimeError("Empty crop")
 
     crop_resized = cv2.resize(crop_bgr, (GEN_SIZE, GEN_SIZE), interpolation=cv2.INTER_LANCZOS4)
     crop_pil = Image.fromarray(cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB))
@@ -173,7 +204,7 @@ def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False))
         return None, "Drop a source face first."
     if not target_files:
         return None, "Drop at least one target."
-    src_bgr = cv2.cvtColor(source_img, cv2.COLOR_RGB2BGR)
+    src_bgr = normalize_image(cv2.cvtColor(source_img, cv2.COLOR_RGB2BGR))
     src_face = biggest_face(src_bgr)
     if src_face is None:
         return None, "No face detected in the source image. Try a clearer front-facing photo."
