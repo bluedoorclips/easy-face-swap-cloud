@@ -28,6 +28,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DTYPE = torch.float16
 IP_SCALE, CN_SCALE, STEPS, TARGET_SIM, MAX_ATTEMPTS, GEN_SIZE, MAX_INPUT_DIM = 0.85, 0.85, 22, 0.65, 2, 1024, 2048
+CROP_PAD = 1.15  # multiplier on face bbox for crop region (tight = kps fill canvas = InstantID happy)
 
 print("=" * 60)
 print("Easy Face Swap (cloud) — loading...")
@@ -110,7 +111,6 @@ def swap_one(source_emb, target_path):
         target_bgr = load_image_bgr(target_path)
     except Exception as e:
         raise RuntimeError(f"[step:load] {type(e).__name__}: {e}")
-    print(f"target shape: {target_bgr.shape} dtype: {target_bgr.dtype}", flush=True)
 
     try:
         tgt_face = biggest_face(target_bgr)
@@ -124,7 +124,7 @@ def swap_one(source_emb, target_path):
         x1, y1, x2, y2 = tgt_face.bbox.astype(int)
         w, h = max(1, x2 - x1), max(1, y2 - y1)
         cx, cy = (x1+x2)//2, (y1+y2)//2
-        side = int(max(w, h) * 1.3)
+        side = int(max(w, h) * CROP_PAD)
         side = side if side % 2 == 0 else side + 1
         sx1 = max(0, cx - side//2); sy1 = max(0, cy - side//2)
         sx2 = min(W, sx1 + side);   sy2 = min(H, sy1 + side)
@@ -132,7 +132,6 @@ def swap_one(source_emb, target_path):
             raise RuntimeError(f"face crop {sx2-sx1}x{sy2-sy1} too small (face near edge)")
         crop_bgr = target_bgr[sy1:sy2, sx1:sx2]
         ch, cw = crop_bgr.shape[:2]
-        print(f"crop shape: {crop_bgr.shape}", flush=True)
         crop_resized = cv2.resize(crop_bgr, (GEN_SIZE, GEN_SIZE), interpolation=cv2.INTER_LANCZOS4)
         crop_pil = Image.fromarray(cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB))
         kps_in_crop = tgt_face.kps - np.array([sx1, sy1])
@@ -161,7 +160,6 @@ def swap_one(source_emb, target_path):
                 width=GEN_SIZE, height=GEN_SIZE, generator=gen,
             ).images[0]
             gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
-            print(f"[attempt {attempt}] gen shape: {gen_full.shape} dtype: {gen_full.dtype}", flush=True)
             if best is None or best.size == 0:
                 best = gen_full
         except Exception as e:
@@ -171,7 +169,9 @@ def swap_one(source_emb, target_path):
             gf = face_app.get(gen_full)
             if gf:
                 biggest = max(gf, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-                sim = cosine_sim(source_emb, biggest.normed_embedding)
+                # Compare normalised embeddings for similarity scoring
+                src_norm = source_emb / (np.linalg.norm(source_emb) + 1e-9)
+                sim = cosine_sim(src_norm, biggest.normed_embedding)
             else:
                 sim = -1.0
             if sim > best_sim:
@@ -187,7 +187,6 @@ def swap_one(source_emb, target_path):
         raise RuntimeError("[step:diffuse] all attempts produced empty results")
 
     try:
-        print(f"[composite] best.shape={best.shape}, target_crop=({cw},{ch}) target_full=({W},{H})", flush=True)
         gen_bgr = cv2.resize(best, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
         mask = np.zeros((ch, cw), dtype=np.uint8)
         cv2.ellipse(mask, (cw//2, ch//2), (int(cw*0.40), int(ch*0.46)), 0, 0, 360, 255, -1)
@@ -202,7 +201,7 @@ def swap_one(source_emb, target_path):
             result_bgr[sy1:sy2, sx1:sx2] = (gen_bgr * soft + crop_orig * (1-soft)).astype(np.uint8)
         return result_bgr, best_sim
     except Exception as e:
-        raise RuntimeError(f"[step:composite] {type(e).__name__}: {e} (best.shape={getattr(best,'shape','?')}, crop=({cw},{ch}))")
+        raise RuntimeError(f"[step:composite] {type(e).__name__}: {e}")
 
 
 def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False)):
@@ -217,7 +216,8 @@ def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False))
         return None, f"Source image error: {e}"
     if src_face is None:
         return None, "No face detected in the source image. Try a clearer front-facing photo."
-    source_emb = src_face.normed_embedding
+    # InstantID uses the RAW (unnormalised) ArcFace embedding for identity conditioning
+    source_emb = src_face.embedding
 
     run_dir = OUTPUT_DIR / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(exist_ok=True)
@@ -243,7 +243,7 @@ def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False))
     if sim_log:
         sims = [float(line.split(': ')[1].split('%')[0]) for line in sim_log]
         avg = sum(sims) / len(sims)
-        msg = f"Done: {len(results)} swapped → {run_dir}\n\n**Avg identity match: {avg:.0f}%**\n\n" + "\n".join(sim_log[:20])
+        msg = f"Done: {len(results)} swapped to {run_dir}\n\n**Avg identity match: {avg:.0f}%**\n\n" + "\n".join(sim_log[:20])
     else:
         msg = "No images were successfully swapped."
     if failed:
