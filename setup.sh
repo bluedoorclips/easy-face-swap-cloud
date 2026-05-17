@@ -17,9 +17,11 @@ pip install -q -U pip
 pip install -q -U 'gradio>=5,<6'
 pip install -q 'transformers==4.46.3' 'diffusers==0.31.0' 'peft==0.13.2' 'accelerate==1.1.1' 'huggingface_hub==0.25.2'
 pip install -q insightface onnxruntime-gpu 'opencv-python<5' einops 'numpy<2' pillow-heif
+# Training-only deps
+pip install -q bitsandbytes datasets prodigyopt tensorboard
 
 echo "--- versions ---"
-python -c "import gradio, huggingface_hub, diffusers, transformers, peft, torch; print(f'gradio={gradio.__version__} hf_hub={huggingface_hub.__version__} diffusers={diffusers.__version__} transformers={transformers.__version__} peft={peft.__version__} torch={torch.__version__} cuda={torch.cuda.is_available()}')"
+python -c "import gradio, huggingface_hub, diffusers, transformers, peft, accelerate, torch; print(f'gradio={gradio.__version__} hf_hub={huggingface_hub.__version__} diffusers={diffusers.__version__} transformers={transformers.__version__} peft={peft.__version__} accelerate={accelerate.__version__} torch={torch.__version__}')"
 
 echo "--- antelopev2 face model (cached on persistent volume) ---"
 PERSIST_DIR=/workspace/insightface_models/antelopev2
@@ -51,7 +53,36 @@ if [ ! -d /workspace/InstantID ]; then
   git clone --depth 1 https://github.com/instantX-research/InstantID.git /workspace/InstantID
 fi
 
-mkdir -p /workspace/hf_cache /workspace/outputs
+echo "--- download diffusers training script ---"
+if [ ! -f /workspace/diffusers_train_dreambooth_lora_sdxl.py ]; then
+  wget -q -O /workspace/diffusers_train_dreambooth_lora_sdxl.py \
+    "https://raw.githubusercontent.com/huggingface/diffusers/v0.31.0-release/examples/dreambooth/train_dreambooth_lora_sdxl.py"
+  echo "Training script size: $(wc -l < /workspace/diffusers_train_dreambooth_lora_sdxl.py) lines"
+fi
+
+echo "--- configure accelerate ---"
+# Single-GPU non-distributed config
+mkdir -p /root/.cache/huggingface/accelerate
+cat > /root/.cache/huggingface/accelerate/default_config.yaml <<'YAML'
+compute_environment: LOCAL_MACHINE
+debug: false
+distributed_type: 'NO'
+downcast_bf16: 'no'
+gpu_ids: '0'
+machine_rank: 0
+main_training_function: main
+mixed_precision: fp16
+num_machines: 1
+num_processes: 1
+rdzv_backend: static
+same_network: true
+tpu_env: []
+tpu_use_cluster: false
+tpu_use_sudo: false
+use_cpu: false
+YAML
+
+mkdir -p /workspace/hf_cache /workspace/outputs /workspace/loras /workspace/training
 export HF_HOME=/workspace/hf_cache
 
 echo "--- launching app ---"
