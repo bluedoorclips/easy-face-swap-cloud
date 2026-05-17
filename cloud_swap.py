@@ -2,8 +2,12 @@
 Easy Face Swap — cloud edition.
 Tab 1: Swap (InstantID img2img + optional character LoRA)
 Tab 2: Train Character (DreamBooth-LoRA SDXL via subprocess)
+
+API supports overnight batch training:
+  stage_character(name, photos) -> upload photos, returns fast
+  train_character(name, photos, max_steps) -> trains; if photos empty, reuses staged
 """
-import os, sys, time, traceback, subprocess, threading, shutil
+import os, sys, time, traceback, subprocess, shutil
 from pathlib import Path
 
 sys.path.insert(0, "/workspace/InstantID")
@@ -45,7 +49,7 @@ MAX_ATTEMPTS  = 2
 GEN_SIZE      = 1024
 MAX_INPUT_DIM = 2048
 CROP_PAD      = 1.35
-LORA_SCALE    = 0.8   # how strongly the character LoRA influences generation
+LORA_SCALE    = 0.8
 
 BASE_PROMPT = "candid photograph, natural soft lighting, sharp focus, high resolution, film grain"
 NEG_PROMPT = (
@@ -79,14 +83,15 @@ else:
     pipe.enable_model_cpu_offload(); pipe.enable_vae_tiling(); pipe.enable_vae_slicing()
 pipe.set_progress_bar_config(disable=True)
 
-# Track currently-loaded LoRA so we can unload before loading another
 _current_lora = {"name": None}
-
 print("Ready.")
 
 
+def _valid_name(name):
+    return name and name.isalnum() and name == name.lower()
+
+
 def list_loras():
-    """List trained characters (folders under /workspace/loras with safetensors inside)."""
     out = []
     if not LORAS_DIR.exists():
         return out
@@ -96,11 +101,23 @@ def list_loras():
     return out
 
 
+def list_staged():
+    out = []
+    if not TRAINING_DIR.exists():
+        return out
+    for d in sorted(TRAINING_DIR.iterdir()):
+        if d.is_dir():
+            imgs_dir = d / "images"
+            if imgs_dir.exists():
+                n = sum(1 for f in imgs_dir.iterdir() if f.suffix.lower() in ('.png','.jpg','.jpeg'))
+                if n > 0:
+                    out.append(f"{d.name} ({n} photos)")
+    return out
+
+
 def ensure_lora_loaded(name):
-    """Load the named LoRA into the pipe if not already loaded. Pass name=None to unload."""
     if _current_lora["name"] == name:
         return
-    # Unload any current LoRA
     if _current_lora["name"] is not None:
         try:
             pipe.unload_lora_weights()
@@ -205,9 +222,8 @@ def swap_one(source_emb, target_path, lora_name=None):
     kps_scaled = kps_in_crop * np.array([GEN_SIZE/cw, GEN_SIZE/ch])
     kps_image = draw_kps(crop_pil.copy(), kps_scaled)
 
-    # Build prompt with trigger word if LoRA is loaded
     prompt = BASE_PROMPT
-    cross_attn = {}
+    cross_attn = None
     if lora_name:
         prompt = f"a photo of {lora_name} woman, " + BASE_PROMPT
         cross_attn = {"scale": LORA_SCALE}
@@ -224,7 +240,7 @@ def swap_one(source_emb, target_path, lora_name=None):
             strength=STRENGTH, controlnet_conditioning_scale=CN_SCALE,
             num_inference_steps=STEPS, guidance_scale=GUIDANCE,
             width=GEN_SIZE, height=GEN_SIZE, generator=gen,
-            cross_attention_kwargs=cross_attn if cross_attn else None,
+            cross_attention_kwargs=cross_attn,
         ).images[0]
         gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
         if best is None or best.size == 0:
@@ -272,7 +288,6 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
     if not target_files:
         return None, "Drop at least one target."
 
-    # Load/unload character LoRA
     lora_name = (character_lora or "").strip()
     if lora_name == "(none)":
         lora_name = ""
@@ -323,30 +338,22 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
 
 
 def refresh_lora_list():
-    loras = list_loras()
-    return gr.update(choices=["(none)"] + loras, value="(none)")
+    return gr.update(choices=["(none)"] + list_loras(), value="(none)")
 
 
-# ---- Training tab ----
-_train_status = {"running": False, "log": "", "last_lora": None}
+# ---- Training endpoints ----
 
-
-def train_character(character_name, photos, max_steps, progress=gr.Progress(track_tqdm=False)):
+def stage_character(character_name, photos):
+    """Upload photos for a character. Fast - just saves files. No training."""
     name = (character_name or "").strip().lower()
-    if not name or not name.isalnum():
-        return "Character name must be alphanumeric (letters/numbers only), no spaces."
-    if not photos or len(photos) < 5:
-        return f"Need at least 5 photos, got {len(photos) if photos else 0}."
-
-    if _train_status["running"]:
-        return "A training job is already running. Wait for it to finish."
-
+    if not _valid_name(name):
+        return f"Bad name '{name}'. Must be lowercase alphanumeric."
+    if not photos:
+        return "No photos provided."
     images_dir = TRAINING_DIR / name / "images"
     if images_dir.exists():
         shutil.rmtree(images_dir)
     images_dir.mkdir(parents=True)
-
-    # Copy all uploaded photos
     n_saved = 0
     for i, f in enumerate(photos):
         src = Path(f if isinstance(f, str) else f.name)
@@ -356,42 +363,69 @@ def train_character(character_name, photos, max_steps, progress=gr.Progress(trac
                 img.save(images_dir / f"{name}_{i:04d}.png")
             n_saved += 1
         except Exception as e:
-            print(f"[copy-skip] {src.name}: {e}", flush=True)
+            print(f"[stage-skip] {src.name}: {e}", flush=True)
+    return f"Staged {n_saved} photos for '{name}' at {images_dir}"
 
-    if n_saved < 5:
-        return f"Only {n_saved} photos were usable. Try clearer images."
 
-    _train_status["running"] = True
-    _train_status["log"] = f"Starting training for '{name}' with {n_saved} images, {max_steps} steps...\n"
+def train_character(character_name, photos, max_steps, progress=gr.Progress(track_tqdm=False)):
+    """Train a LoRA. If photos provided, stages them first. Otherwise uses previously-staged photos."""
+    name = (character_name or "").strip().lower()
+    if not _valid_name(name):
+        return f"Bad name '{name}'. Must be lowercase alphanumeric."
 
-    # Run training in subprocess
+    images_dir = TRAINING_DIR / name / "images"
+
+    if photos:
+        # Restage with provided photos
+        if images_dir.exists():
+            shutil.rmtree(images_dir)
+        images_dir.mkdir(parents=True)
+        for i, f in enumerate(photos):
+            src = Path(f if isinstance(f, str) else f.name)
+            try:
+                with Image.open(src) as img:
+                    img = ImageOps.exif_transpose(img).convert("RGB")
+                    img.save(images_dir / f"{name}_{i:04d}.png")
+            except Exception as e:
+                print(f"[stage-skip] {src.name}: {e}", flush=True)
+
+    if not images_dir.exists():
+        return f"No photos staged for '{name}'. Use 'Stage' first or provide photos."
+    n_images = sum(1 for p in images_dir.iterdir() if p.suffix.lower() in ('.png','.jpg','.jpeg'))
+    if n_images < 5:
+        return f"Only {n_images} photos available. Need at least 5."
+
+    out_dir = LORAS_DIR / name
+    progress(0.01, desc=f"Training '{name}' with {n_images} photos...")
+
     cmd = [sys.executable, "/workspace/app/train_lora.py", name, str(images_dir),
            f"--max_train_steps={int(max_steps)}"]
-    try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1)
-        line_count = 0
-        for line in proc.stdout:
-            _train_status["log"] += line
-            line_count += 1
-            # Update gradio progress periodically
-            if line_count % 20 == 0:
-                # Try to find step info in log to estimate progress
-                progress(0.5, desc=f"Training... {line_count} log lines")
-        proc.wait()
-        rc = proc.returncode
-    finally:
-        _train_status["running"] = False
+    print(f"[train] {' '.join(cmd)}", flush=True)
+    log_lines = []
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, bufsize=1)
+    line_count = 0
+    for line in proc.stdout:
+        log_lines.append(line.rstrip())
+        print(line, end='', flush=True)
+        line_count += 1
+        if line_count % 30 == 0:
+            progress(min(0.98, line_count/2000), desc=f"Training '{name}'... {line_count} log lines")
+    proc.wait()
+    rc = proc.returncode
 
-    lora_file = LORAS_DIR / name / "pytorch_lora_weights.safetensors"
+    lora_file = out_dir / "pytorch_lora_weights.safetensors"
     if rc == 0 and lora_file.exists():
         size_mb = lora_file.stat().st_size / (1024*1024)
-        _train_status["last_lora"] = name
-        return (f"Success. LoRA '{name}' saved ({size_mb:.0f} MB).\n"
-                f"Switch to the Swap tab and pick '{name}' from the Character dropdown.\n\n"
-                f"Last 20 log lines:\n" + "\n".join(_train_status["log"].splitlines()[-20:]))
+        return f"SUCCESS: '{name}' LoRA saved ({size_mb:.0f} MB).\n\nLast 15 log lines:\n" + "\n".join(log_lines[-15:])
     else:
-        return f"Training failed (rc={rc}).\n\nLast 30 log lines:\n" + "\n".join(_train_status["log"].splitlines()[-30:])
+        return f"FAILED (rc={rc}).\n\nLast 30 log lines:\n" + "\n".join(log_lines[-30:])
+
+
+def show_status():
+    loras = list_loras()
+    staged = list_staged()
+    return f"**Trained LoRAs ({len(loras)}):** {', '.join(loras) if loras else '(none)'}\n\n**Staged but not trained:** {', '.join(staged) if staged else '(none)'}"
 
 
 with gr.Blocks(title="Easy Face Swap (Cloud)") as demo:
@@ -413,12 +447,16 @@ with gr.Blocks(title="Easy Face Swap (Cloud)") as demo:
         refresh_btn.click(refresh_lora_list, [], [character_lora])
     with gr.Tab("Train Character"):
         gr.Markdown("**Train a character LoRA.** Pick a short name (e.g. `baileyy`), drop 15-50 clear face photos, click Train. Takes ~30-40 min on the GPU.")
-        train_name = gr.Textbox(label="Character name (lowercase, letters/numbers only)", placeholder="e.g. baileyy")
+        train_name = gr.Textbox(label="Character name (lowercase, alphanumeric)", placeholder="e.g. baileyy")
         train_photos = gr.Files(label="Training photos (15-50)", file_types=["image"], file_count="multiple")
         train_steps = gr.Slider(label="Training steps", minimum=400, maximum=2000, value=1200, step=100)
         train_btn = gr.Button("Train LoRA", variant="primary", size="lg")
         train_log = gr.Markdown("")
         train_btn.click(train_character, [train_name, train_photos, train_steps], [train_log])
+    with gr.Tab("Status"):
+        status_btn = gr.Button("Refresh status")
+        status_md = gr.Markdown(show_status())
+        status_btn.click(show_status, [], [status_md])
 
 
 if __name__ == "__main__":
@@ -428,3 +466,13 @@ if __name__ == "__main__":
         show_error=True,
         allowed_paths=[str(OUTPUT_DIR)],
     )
+
+
+# Expose stage_character as a named endpoint via Blocks API hack
+# (Gradio 5 auto-discovers functions used in .click; for API-only functions
+# we use api_name in a hidden Interface.)
+# Actually we need it discoverable - register a tiny Interface alongside.
+_stage_iface = gr.Interface(fn=stage_character,
+                            inputs=[gr.Textbox(label="name"), gr.Files(label="photos", file_count="multiple")],
+                            outputs=gr.Textbox(label="result"),
+                            api_name="stage_character")
