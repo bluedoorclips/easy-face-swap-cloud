@@ -162,7 +162,6 @@ def swap_one(source_emb, target_path):
             ).images[0]
             gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
             print(f"[attempt {attempt}] gen shape: {gen_full.shape} dtype: {gen_full.dtype}", flush=True)
-            # Always keep the latest generated image; sim scoring just decides if we retry
             if best is None or best.size == 0:
                 best = gen_full
         except Exception as e:
@@ -182,7 +181,6 @@ def swap_one(source_emb, target_path):
                 break
             cur_ip = min(1.0, cur_ip + 0.05)
         except Exception as e:
-            # Don't fail composite if scoring fails — we still have gen_full as best
             print(f"[score attempt={attempt}] {type(e).__name__}: {e}", flush=True)
 
     if best is None or best.size == 0:
@@ -268,4 +266,4 @@ with gr.Blocks(title="Easy Face Swap (Cloud)") as demo:
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0", server_port=7860, show_error=True)
