@@ -1,5 +1,6 @@
 """
-Easy Face Swap — cloud edition. Pure drag-drop UI, no slider tuning exposed.
+Easy Face Swap — cloud edition. Uses InstantID img2img so the result is regenerated
+FROM the target photo (preserving its lighting/skin/hair) rather than pasted on top.
 """
 import os, sys, time, traceback
 from pathlib import Path
@@ -21,33 +22,35 @@ try:
 except Exception:
     pass
 
-from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline, draw_kps
+from pipeline_stable_diffusion_xl_instantid_img2img import StableDiffusionXLInstantIDImg2ImgPipeline
+from pipeline_stable_diffusion_xl_instantid import draw_kps
 
 OUTPUT_DIR = Path("/workspace/outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DTYPE = torch.float16
 
-# Tuned for photo-realism (less AI-plastic look)
-IP_SCALE       = 0.90   # stronger identity match
-CN_SCALE       = 0.75   # looser pose lock so face can look natural, not stiff
-STEPS          = 30     # more denoising steps = sharper detail
-GUIDANCE       = 3.5    # lower CFG = less "over-perfect" plastic look
-TARGET_SIM     = 0.55   # threshold for auto-retry
-MAX_ATTEMPTS   = 2
-GEN_SIZE       = 1024
-MAX_INPUT_DIM  = 2048
-CROP_PAD       = 1.15
+# Tuned defaults
+IP_SCALE      = 0.85
+CN_SCALE      = 0.80
+STRENGTH      = 0.72   # img2img denoise: 0=keep target, 1=full regen. 0.7-0.8 swaps face but keeps surround
+STEPS         = 30
+GUIDANCE      = 4.0
+TARGET_SIM    = 0.55
+MAX_ATTEMPTS  = 2
+GEN_SIZE      = 1024
+MAX_INPUT_DIM = 2048
+CROP_PAD      = 1.25   # slightly larger so we have skin context for inpainting to blend with
 
 PROMPT = (
     "raw candid iPhone photo of a real person, natural unretouched skin with visible pores and freckles, "
     "fine skin texture, slight asymmetry, soft natural lighting, photojournalism, sharp focus, "
-    "high resolution, depth of field, film grain"
+    "high resolution, film grain"
 )
 NEG_PROMPT = (
     "AI generated, CGI, 3d render, plastic skin, smooth skin, airbrushed, doll, perfect symmetry, "
-    "glossy, overexposed highlights, cartoon, illustration, anime, painting, deformed, ugly, "
-    "blurry, lowres, oversaturated, makeup-heavy, beauty filter, instagram filter"
+    "glossy, cartoon, illustration, anime, painting, deformed, ugly, blurry, lowres, "
+    "makeup-heavy, beauty filter, instagram filter, fake"
 )
 
 print("=" * 60)
@@ -58,10 +61,10 @@ print("[1/2] Face analyzer (antelopev2)...")
 face_app = FaceAnalysis(name="antelopev2", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
 face_app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.3)
 
-print("[2/2] InstantID + RealVisXL...")
+print("[2/2] InstantID img2img + RealVisXL...")
 instantid_dir = snapshot_download("InstantX/InstantID", allow_patterns=["ControlNetModel/*", "ip-adapter.bin"])
 controlnet = ControlNetModel.from_pretrained(os.path.join(instantid_dir, "ControlNetModel"), torch_dtype=DTYPE)
-pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
+pipe = StableDiffusionXLInstantIDImg2ImgPipeline.from_pretrained(
     "SG161222/RealVisXL_V4.0", controlnet=controlnet, torch_dtype=DTYPE,
     variant="fp16", use_safetensors=True,
 )
@@ -156,7 +159,7 @@ def swap_one(source_emb, target_path):
         crop_pil = Image.fromarray(cv2.cvtColor(crop_resized, cv2.COLOR_BGR2RGB))
         kps_in_crop = tgt_face.kps - np.array([sx1, sy1])
         kps_scaled = kps_in_crop * np.array([GEN_SIZE/cw, GEN_SIZE/ch])
-        kps_image = draw_kps(crop_pil, kps_scaled)
+        kps_image = draw_kps(crop_pil.copy(), kps_scaled)
     except Exception as e:
         raise RuntimeError(f"[step:crop+kps] {type(e).__name__}: {e}")
 
@@ -172,11 +175,15 @@ def swap_one(source_emb, target_path):
             result = pipe(
                 prompt=PROMPT,
                 negative_prompt=NEG_PROMPT,
+                image=crop_pil,                # IMG2IMG: target crop is the init image
+                control_image=kps_image,       # face landmarks for pose lock
                 image_embeds=torch.from_numpy(source_emb).unsqueeze(0),
-                image=kps_image,
+                strength=STRENGTH,             # only partial denoise = preserve surrounding context
                 controlnet_conditioning_scale=CN_SCALE,
-                num_inference_steps=STEPS, guidance_scale=GUIDANCE,
-                width=GEN_SIZE, height=GEN_SIZE, generator=gen,
+                num_inference_steps=STEPS,
+                guidance_scale=GUIDANCE,
+                width=GEN_SIZE, height=GEN_SIZE,
+                generator=gen,
             ).images[0]
             gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
             if best is None or best.size == 0:
@@ -205,18 +212,23 @@ def swap_one(source_emb, target_path):
         raise RuntimeError("[step:diffuse] all attempts produced empty results")
 
     try:
+        # The img2img result already contains regenerated context around the face,
+        # so we just resize back and paste the crop region into the full target.
+        # No seamlessClone hack needed — the diffusion already blended the face naturally.
         gen_bgr = cv2.resize(best, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
-        mask = np.zeros((ch, cw), dtype=np.uint8)
-        cv2.ellipse(mask, (cw//2, ch//2), (int(cw*0.40), int(ch*0.46)), 0, 0, 360, 255, -1)
-        mask = cv2.erode(mask, np.ones((5,5), np.uint8), iterations=2)
         result_bgr = target_bgr.copy()
-        crop_orig = result_bgr[sy1:sy2, sx1:sx2].copy()
-        try:
-            cloned = cv2.seamlessClone(gen_bgr, crop_orig, mask, (cw//2, ch//2), cv2.NORMAL_CLONE)
-            result_bgr[sy1:sy2, sx1:sx2] = cloned
-        except cv2.error:
-            soft = cv2.GaussianBlur(mask.astype(np.float32)/255.0, (0,0), 12)[..., np.newaxis]
-            result_bgr[sy1:sy2, sx1:sx2] = (gen_bgr * soft + crop_orig * (1-soft)).astype(np.uint8)
+        # Soft-feathered alpha so the rectangular crop edge doesn't show against the rest of the photo
+        mask = np.ones((ch, cw), dtype=np.float32)
+        # Feather inset ~8% of crop dimension
+        feather = max(8, min(ch, cw) // 12)
+        for i in range(feather):
+            v = i / feather
+            mask[i, :] *= v; mask[-(i+1), :] *= v
+            mask[:, i] *= v; mask[:, -(i+1)] *= v
+        mask = cv2.GaussianBlur(mask, (0,0), max(1, feather//2))[..., np.newaxis]
+        crop_orig = result_bgr[sy1:sy2, sx1:sx2].astype(np.float32)
+        blended = (gen_bgr.astype(np.float32) * mask + crop_orig * (1 - mask)).astype(np.uint8)
+        result_bgr[sy1:sy2, sx1:sx2] = blended
         return result_bgr, best_sim
     except Exception as e:
         raise RuntimeError(f"[step:composite] {type(e).__name__}: {e}")
