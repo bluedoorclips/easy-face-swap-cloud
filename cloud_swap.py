@@ -1,6 +1,5 @@
 """
-Easy Face Swap — cloud edition. Uses InstantID img2img so the result is regenerated
-FROM the target photo (preserving its lighting/skin/hair) rather than pasted on top.
+Easy Face Swap — cloud edition. InstantID img2img + Poisson blend back into the full target.
 """
 import os, sys, time, traceback
 from pathlib import Path
@@ -30,27 +29,26 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DTYPE = torch.float16
 
-# Tuned defaults
 IP_SCALE      = 0.85
 CN_SCALE      = 0.80
-STRENGTH      = 0.72   # img2img denoise: 0=keep target, 1=full regen. 0.7-0.8 swaps face but keeps surround
-STEPS         = 30
-GUIDANCE      = 4.0
+STRENGTH      = 0.65   # keep more of target lighting/colour
+STEPS         = 32
+GUIDANCE      = 3.2    # softer = less plastic AI-perfect look
 TARGET_SIM    = 0.55
 MAX_ATTEMPTS  = 2
 GEN_SIZE      = 1024
 MAX_INPUT_DIM = 2048
-CROP_PAD      = 1.25   # slightly larger so we have skin context for inpainting to blend with
+CROP_PAD      = 1.35   # extra skin context for Poisson blend to work with
 
 PROMPT = (
-    "raw candid iPhone photo of a real person, natural unretouched skin with visible pores and freckles, "
-    "fine skin texture, slight asymmetry, soft natural lighting, photojournalism, sharp focus, "
-    "high resolution, film grain"
+    "raw candid iPhone photo of a real person, natural unretouched skin, visible pores and freckles, "
+    "fine skin texture with slight asymmetry, soft natural lighting, photojournalism, sharp focus, "
+    "depth of field, film grain"
 )
 NEG_PROMPT = (
-    "AI generated, CGI, 3d render, plastic skin, smooth skin, airbrushed, doll, perfect symmetry, "
-    "glossy, cartoon, illustration, anime, painting, deformed, ugly, blurry, lowres, "
-    "makeup-heavy, beauty filter, instagram filter, fake"
+    "AI generated, CGI, 3d render, plastic skin, smooth skin, airbrushed, doll face, perfect symmetry, "
+    "glossy, cartoon, illustration, painting, deformed, ugly, blurry, lowres, "
+    "makeup-heavy, beauty filter, instagram filter, fake, posterized"
 )
 
 print("=" * 60)
@@ -175,10 +173,10 @@ def swap_one(source_emb, target_path):
             result = pipe(
                 prompt=PROMPT,
                 negative_prompt=NEG_PROMPT,
-                image=crop_pil,                # IMG2IMG: target crop is the init image
-                control_image=kps_image,       # face landmarks for pose lock
+                image=crop_pil,
+                control_image=kps_image,
                 image_embeds=torch.from_numpy(source_emb).unsqueeze(0),
-                strength=STRENGTH,             # only partial denoise = preserve surrounding context
+                strength=STRENGTH,
                 controlnet_conditioning_scale=CN_SCALE,
                 num_inference_steps=STEPS,
                 guidance_scale=GUIDANCE,
@@ -212,23 +210,20 @@ def swap_one(source_emb, target_path):
         raise RuntimeError("[step:diffuse] all attempts produced empty results")
 
     try:
-        # The img2img result already contains regenerated context around the face,
-        # so we just resize back and paste the crop region into the full target.
-        # No seamlessClone hack needed — the diffusion already blended the face naturally.
         gen_bgr = cv2.resize(best, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
         result_bgr = target_bgr.copy()
-        # Soft-feathered alpha so the rectangular crop edge doesn't show against the rest of the photo
-        mask = np.ones((ch, cw), dtype=np.float32)
-        # Feather inset ~8% of crop dimension
-        feather = max(8, min(ch, cw) // 12)
-        for i in range(feather):
-            v = i / feather
-            mask[i, :] *= v; mask[-(i+1), :] *= v
-            mask[:, i] *= v; mask[:, -(i+1)] *= v
-        mask = cv2.GaussianBlur(mask, (0,0), max(1, feather//2))[..., np.newaxis]
-        crop_orig = result_bgr[sy1:sy2, sx1:sx2].astype(np.float32)
-        blended = (gen_bgr.astype(np.float32) * mask + crop_orig * (1 - mask)).astype(np.uint8)
-        result_bgr[sy1:sy2, sx1:sx2] = blended
+        crop_orig = result_bgr[sy1:sy2, sx1:sx2].copy()
+        # Generous elliptical mask covering the face + a bit of surround.
+        # cv2.seamlessClone uses Poisson blending to match the gradient — boundary disappears.
+        mask = np.zeros((ch, cw), dtype=np.uint8)
+        cv2.ellipse(mask, (cw//2, ch//2), (int(cw*0.42), int(ch*0.48)), 0, 0, 360, 255, -1)
+        mask = cv2.erode(mask, np.ones((5,5), np.uint8), iterations=2)
+        try:
+            cloned = cv2.seamlessClone(gen_bgr, crop_orig, mask, (cw//2, ch//2), cv2.NORMAL_CLONE)
+            result_bgr[sy1:sy2, sx1:sx2] = cloned
+        except cv2.error:
+            soft = cv2.GaussianBlur(mask.astype(np.float32)/255.0, (0,0), 18)[..., np.newaxis]
+            result_bgr[sy1:sy2, sx1:sx2] = (gen_bgr.astype(np.float32) * soft + crop_orig.astype(np.float32) * (1-soft)).astype(np.uint8)
         return result_bgr, best_sim
     except Exception as e:
         raise RuntimeError(f"[step:composite] {type(e).__name__}: {e}")
