@@ -27,8 +27,28 @@ OUTPUT_DIR = Path("/workspace/outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 DTYPE = torch.float16
-IP_SCALE, CN_SCALE, STEPS, TARGET_SIM, MAX_ATTEMPTS, GEN_SIZE, MAX_INPUT_DIM = 0.85, 0.85, 22, 0.65, 2, 1024, 2048
-CROP_PAD = 1.15  # multiplier on face bbox for crop region (tight = kps fill canvas = InstantID happy)
+
+# Tuned for photo-realism (less AI-plastic look)
+IP_SCALE       = 0.90   # stronger identity match
+CN_SCALE       = 0.75   # looser pose lock so face can look natural, not stiff
+STEPS          = 30     # more denoising steps = sharper detail
+GUIDANCE       = 3.5    # lower CFG = less "over-perfect" plastic look
+TARGET_SIM     = 0.55   # threshold for auto-retry
+MAX_ATTEMPTS   = 2
+GEN_SIZE       = 1024
+MAX_INPUT_DIM  = 2048
+CROP_PAD       = 1.15
+
+PROMPT = (
+    "raw candid iPhone photo of a real person, natural unretouched skin with visible pores and freckles, "
+    "fine skin texture, slight asymmetry, soft natural lighting, photojournalism, sharp focus, "
+    "high resolution, depth of field, film grain"
+)
+NEG_PROMPT = (
+    "AI generated, CGI, 3d render, plastic skin, smooth skin, airbrushed, doll, perfect symmetry, "
+    "glossy, overexposed highlights, cartoon, illustration, anime, painting, deformed, ugly, "
+    "blurry, lowres, oversaturated, makeup-heavy, beauty filter, instagram filter"
+)
 
 print("=" * 60)
 print("Easy Face Swap (cloud) — loading...")
@@ -129,7 +149,7 @@ def swap_one(source_emb, target_path):
         sx1 = max(0, cx - side//2); sy1 = max(0, cy - side//2)
         sx2 = min(W, sx1 + side);   sy2 = min(H, sy1 + side)
         if sx2 - sx1 < 64 or sy2 - sy1 < 64:
-            raise RuntimeError(f"face crop {sx2-sx1}x{sy2-sy1} too small (face near edge)")
+            raise RuntimeError(f"face crop {sx2-sx1}x{sy2-sy1} too small")
         crop_bgr = target_bgr[sy1:sy2, sx1:sx2]
         ch, cw = crop_bgr.shape[:2]
         crop_resized = cv2.resize(crop_bgr, (GEN_SIZE, GEN_SIZE), interpolation=cv2.INTER_LANCZOS4)
@@ -150,13 +170,12 @@ def swap_one(source_emb, target_path):
             seed = int(time.time()*1000) % (2**31) + attempt*7919
             gen = torch.Generator(device="cuda").manual_seed(seed)
             result = pipe(
-                prompt="raw photo of a person, ultra realistic photo, natural skin with pores, detailed eyes, "
-                       "natural lighting, sharp focus, high resolution, candid",
-                negative_prompt="cartoon, painting, 3d, plastic, smooth, airbrushed, blurry, lowres, deformed, ugly",
+                prompt=PROMPT,
+                negative_prompt=NEG_PROMPT,
                 image_embeds=torch.from_numpy(source_emb).unsqueeze(0),
                 image=kps_image,
                 controlnet_conditioning_scale=CN_SCALE,
-                num_inference_steps=STEPS, guidance_scale=5.0,
+                num_inference_steps=STEPS, guidance_scale=GUIDANCE,
                 width=GEN_SIZE, height=GEN_SIZE, generator=gen,
             ).images[0]
             gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
@@ -169,7 +188,6 @@ def swap_one(source_emb, target_path):
             gf = face_app.get(gen_full)
             if gf:
                 biggest = max(gf, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-                # Compare normalised embeddings for similarity scoring
                 src_norm = source_emb / (np.linalg.norm(source_emb) + 1e-9)
                 sim = cosine_sim(src_norm, biggest.normed_embedding)
             else:
@@ -216,7 +234,6 @@ def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False))
         return None, f"Source image error: {e}"
     if src_face is None:
         return None, "No face detected in the source image. Try a clearer front-facing photo."
-    # InstantID uses the RAW (unnormalised) ArcFace embedding for identity conditioning
     source_emb = src_face.embedding
 
     run_dir = OUTPUT_DIR / time.strftime("%Y%m%d_%H%M%S")
@@ -230,7 +247,7 @@ def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False))
         try:
             out_bgr, sim = swap_one(source_emb, path)
             sim_pct = max(0.0, sim) * 100
-            tag = "[GOOD]" if sim >= TARGET_SIM else "[WEAK]"
+            tag = "[GOOD]" if sim >= TARGET_SIM else "[OK]"
             stem = Path(path).stem
             out_path = run_dir / f"swap_{i:03d}_sim{int(sim_pct):02d}_{stem}.png"
             cv2.imwrite(str(out_path), out_bgr)
@@ -243,7 +260,7 @@ def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False))
     if sim_log:
         sims = [float(line.split(': ')[1].split('%')[0]) for line in sim_log]
         avg = sum(sims) / len(sims)
-        msg = f"Done: {len(results)} swapped to {run_dir}\n\n**Avg identity match: {avg:.0f}%**\n\n" + "\n".join(sim_log[:20])
+        msg = f"Done: {len(results)} swapped to {run_dir}\n\nAvg identity match: {avg:.0f}%\n\n" + "\n".join(sim_log[:20])
     else:
         msg = "No images were successfully swapped."
     if failed:
@@ -252,8 +269,8 @@ def swap_batch(source_img, target_files, progress=gr.Progress(track_tqdm=False))
 
 
 with gr.Blocks(title="Easy Face Swap (Cloud)") as demo:
-    gr.Markdown("# Easy Face Swap — Cloud")
-    gr.Markdown("Drop your source face on the left, drop target images on the right, hit **Swap All**.")
+    gr.Markdown("# Easy Face Swap")
+    gr.Markdown("Drop source face on the left, target images on the right, hit **Swap All**.")
     with gr.Row():
         with gr.Column():
             source = gr.Image(label="Source face", type="numpy", height=400)
