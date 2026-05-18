@@ -60,7 +60,6 @@ def main():
         "--checkpointing_steps=999999",
         "--mixed_precision=fp16",
         "--variant=fp16",
-        "--enable_xformers_memory_efficient_attention",
     ]
 
     print(f"[train_lora] Training character '{name}' with {n_images} images for {args.max_train_steps} steps", flush=True)
