@@ -68,6 +68,9 @@ def main():
 
     env = os.environ.copy()
     env["HF_HOME"] = "/workspace/hf_cache"
+    # Fix MKL threading-layer conflict between bitsandbytes' MKL and pytorch's OpenMP
+    env["MKL_THREADING_LAYER"] = "GNU"
+    env["MKL_SERVICE_FORCE_INTEL"] = "1"
     # Stream stdout/stderr live
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, env=env)
