@@ -60,6 +60,7 @@ def main():
         "--checkpointing_steps=999999",
         "--mixed_precision=fp16",
         "--variant=fp16",
+        "--enable_xformers_memory_efficient_attention",
     ]
 
     print(f"[train_lora] Training character '{name}' with {n_images} images for {args.max_train_steps} steps", flush=True)
@@ -68,10 +69,12 @@ def main():
 
     env = os.environ.copy()
     env["HF_HOME"] = "/workspace/hf_cache"
-    # Fix MKL threading-layer conflict between bitsandbytes' MKL and pytorch's OpenMP
+    # MKL/OpenMP conflict workaround for bitsandbytes
     env["MKL_THREADING_LAYER"] = "GNU"
     env["MKL_SERVICE_FORCE_INTEL"] = "1"
-    # Stream stdout/stderr live
+    # Reduce CUDA fragmentation for the save step
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
+
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, bufsize=1, env=env)
     for line in proc.stdout:
@@ -86,7 +89,3 @@ def main():
     else:
         print(f"[train_lora] FAILED (rc={rc})", flush=True)
         sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
