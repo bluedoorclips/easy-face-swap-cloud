@@ -6,8 +6,12 @@ Tab 2: Train Character (Stage photos + Train LoRA)
 API for batch training:
   stage_character(name, photos) -> upload photos, returns fast
   train_character(name, photos, max_steps) -> trains; if photos empty, reuses staged
+
+NB: training subprocess needs ~13 GB VRAM. The main pipeline is ~10 GB on GPU.
+Together they exceed 24 GB, causing OOM at save time. So we move the main pipe
+to CPU before the training subprocess and back to CUDA after.
 """
-import os, sys, time, traceback, subprocess, shutil
+import os, sys, time, traceback, subprocess, shutil, gc
 from pathlib import Path
 
 sys.path.insert(0, "/workspace/InstantID")
@@ -79,12 +83,29 @@ vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
 print(f"GPU VRAM: {vram_gb:.0f} GB")
 if vram_gb >= 20:
     pipe.to("cuda")
+    _PIPE_ON_GPU = True
 else:
     pipe.enable_model_cpu_offload(); pipe.enable_vae_tiling(); pipe.enable_vae_slicing()
+    _PIPE_ON_GPU = False
 pipe.set_progress_bar_config(disable=True)
 
 _current_lora = {"name": None}
 print("Ready.")
+
+
+def _move_pipe_to(device):
+    """Move the main InstantID pipe between GPU and CPU. Used to free VRAM during training."""
+    global _PIPE_ON_GPU
+    try:
+        pipe.to(device)
+        gc.collect()
+        if device == "cpu":
+            torch.cuda.empty_cache()
+        _PIPE_ON_GPU = (device == "cuda")
+        free, total = torch.cuda.mem_get_info()
+        print(f"[gpu] pipe -> {device}, free={free/(1024**3):.1f}GB / {total/(1024**3):.1f}GB", flush=True)
+    except Exception as e:
+        print(f"[gpu] move pipe to {device} failed: {e}", flush=True)
 
 
 def _valid_name(name):
@@ -199,6 +220,9 @@ def compute_source_embedding(source_images):
 
 
 def swap_one(source_emb, target_path, lora_name=None):
+    # Make sure pipe is on GPU (training may have moved it to CPU)
+    if not _PIPE_ON_GPU:
+        _move_pipe_to("cuda")
     target_bgr = load_image_bgr(target_path)
     tgt_face = biggest_face(target_bgr)
     if tgt_face is None:
@@ -366,13 +390,12 @@ def stage_character(character_name, photos):
 
 
 def train_character(character_name, photos, max_steps, progress=gr.Progress(track_tqdm=False)):
-    """Train a LoRA. If photos provided, stages them first. Otherwise uses previously-staged photos."""
+    """Train a LoRA. Moves main pipe to CPU before subprocess to free GPU memory, restores after."""
     name = (character_name or "").strip().lower()
     if not _valid_name(name):
         return f"Bad name '{name}'. Must be lowercase alphanumeric."
 
     images_dir = TRAINING_DIR / name / "images"
-
     if photos:
         if images_dir.exists():
             shutil.rmtree(images_dir)
@@ -387,7 +410,7 @@ def train_character(character_name, photos, max_steps, progress=gr.Progress(trac
                 print(f"[stage-skip] {src.name}: {e}", flush=True)
 
     if not images_dir.exists():
-        return f"No photos staged for '{name}'. Use 'Stage' first or provide photos."
+        return f"No photos staged for '{name}'."
     n_images = sum(1 for p in images_dir.iterdir() if p.suffix.lower() in ('.png','.jpg','.jpeg'))
     if n_images < 5:
         return f"Only {n_images} photos available. Need at least 5."
@@ -395,21 +418,28 @@ def train_character(character_name, photos, max_steps, progress=gr.Progress(trac
     out_dir = LORAS_DIR / name
     progress(0.01, desc=f"Training '{name}' with {n_images} photos...")
 
+    # Free GPU for the training subprocess
+    _move_pipe_to("cpu")
+
     cmd = [sys.executable, "/workspace/app/train_lora.py", name, str(images_dir),
            f"--max_train_steps={int(max_steps)}"]
     print(f"[train] {' '.join(cmd)}", flush=True)
     log_lines = []
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, bufsize=1)
-    line_count = 0
-    for line in proc.stdout:
-        log_lines.append(line.rstrip())
-        print(line, end='', flush=True)
-        line_count += 1
-        if line_count % 30 == 0:
-            progress(min(0.98, line_count/2000), desc=f"Training '{name}'... {line_count} log lines")
-    proc.wait()
-    rc = proc.returncode
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, bufsize=1)
+        line_count = 0
+        for line in proc.stdout:
+            log_lines.append(line.rstrip())
+            print(line, end='', flush=True)
+            line_count += 1
+            if line_count % 30 == 0:
+                progress(min(0.98, line_count/2000), desc=f"Training '{name}'... {line_count} log lines")
+        proc.wait()
+        rc = proc.returncode
+    finally:
+        # Bring the main pipe back to GPU for subsequent swap requests
+        _move_pipe_to("cuda")
 
     lora_file = out_dir / "pytorch_lora_weights.safetensors"
     if rc == 0 and lora_file.exists():
