@@ -3,13 +3,10 @@ Easy Face Swap — cloud edition.
 Tab 1: Swap (InstantID img2img + optional character LoRA)
 Tab 2: Train Character (Stage photos + Train LoRA)
 
-API for batch training:
-  stage_character(name, photos) -> upload photos, returns fast
-  train_character(name, photos, max_steps) -> trains; if photos empty, reuses staged
-
-NB: training subprocess needs ~13 GB VRAM. The main pipeline is ~10 GB on GPU.
-Together they exceed 24 GB, causing OOM at save time. So we move the main pipe
-to CPU before the training subprocess and back to CUDA after.
+When a character LoRA is selected:
+  LORA_SCALE=1.2 (high) so the trained identity dominates
+  IP_SCALE=0.5 (low)   so InstantID only provides loose alignment, not identity override
+  CN_SCALE=0.65        loose pose lock so the face can resemble the LoRA character
 """
 import os, sys, time, traceback, subprocess, shutil, gc
 from pathlib import Path
@@ -43,6 +40,7 @@ for d in (OUTPUT_DIR, LORAS_DIR, TRAINING_DIR):
 DTYPE = torch.float16
 BASE_MODEL    = "SG161222/RealVisXL_V4.0"
 
+# Defaults (no LoRA)
 IP_SCALE      = 0.85
 CN_SCALE      = 0.80
 STRENGTH      = 0.60
@@ -53,7 +51,11 @@ MAX_ATTEMPTS  = 2
 GEN_SIZE      = 1024
 MAX_INPUT_DIM = 2048
 CROP_PAD      = 1.35
-LORA_SCALE    = 0.8
+
+# When a LoRA is loaded, override scales so the trained identity dominates
+LORA_SCALE          = 1.2
+IP_SCALE_WITH_LORA  = 0.5
+CN_SCALE_WITH_LORA  = 0.65
 
 BASE_PROMPT = "candid photograph, natural soft lighting, sharp focus, high resolution, film grain"
 NEG_PROMPT = (
@@ -94,7 +96,6 @@ print("Ready.")
 
 
 def _move_pipe_to(device):
-    """Move the main InstantID pipe between GPU and CPU. Used to free VRAM during training."""
     global _PIPE_ON_GPU
     try:
         pipe.to(device)
@@ -220,7 +221,6 @@ def compute_source_embedding(source_images):
 
 
 def swap_one(source_emb, target_path, lora_name=None):
-    # Make sure pipe is on GPU (training may have moved it to CPU)
     if not _PIPE_ON_GPU:
         _move_pipe_to("cuda")
     target_bgr = load_image_bgr(target_path)
@@ -246,13 +246,19 @@ def swap_one(source_emb, target_path, lora_name=None):
     kps_scaled = kps_in_crop * np.array([GEN_SIZE/cw, GEN_SIZE/ch])
     kps_image = draw_kps(crop_pil.copy(), kps_scaled)
 
-    prompt = BASE_PROMPT
-    cross_attn = None
+    # Pick parameter set based on whether a LoRA is loaded
     if lora_name:
         prompt = f"a photo of {lora_name} woman, " + BASE_PROMPT
         cross_attn = {"scale": LORA_SCALE}
+        ip = IP_SCALE_WITH_LORA
+        cn = CN_SCALE_WITH_LORA
+    else:
+        prompt = BASE_PROMPT
+        cross_attn = None
+        ip = IP_SCALE
+        cn = CN_SCALE
 
-    best = None; best_sim = -1.0; cur_ip = IP_SCALE
+    best = None; best_sim = -1.0; cur_ip = ip
     for attempt in range(MAX_ATTEMPTS):
         pipe.set_ip_adapter_scale(cur_ip)
         seed = int(time.time()*1000) % (2**31) + attempt*7919
@@ -261,7 +267,7 @@ def swap_one(source_emb, target_path, lora_name=None):
             prompt=prompt, negative_prompt=NEG_PROMPT,
             image=crop_pil, control_image=kps_image,
             image_embeds=torch.from_numpy(source_emb).unsqueeze(0),
-            strength=STRENGTH, controlnet_conditioning_scale=CN_SCALE,
+            strength=STRENGTH, controlnet_conditioning_scale=cn,
             num_inference_steps=STEPS, guidance_scale=GUIDANCE,
             width=GEN_SIZE, height=GEN_SIZE, generator=gen,
             cross_attention_kwargs=cross_attn,
@@ -366,7 +372,6 @@ def refresh_lora_list():
 
 
 def stage_character(character_name, photos):
-    """Upload photos for a character. Fast - just saves files. No training."""
     name = (character_name or "").strip().lower()
     if not _valid_name(name):
         return f"Bad name '{name}'. Must be lowercase alphanumeric."
@@ -390,7 +395,6 @@ def stage_character(character_name, photos):
 
 
 def train_character(character_name, photos, max_steps, progress=gr.Progress(track_tqdm=False)):
-    """Train a LoRA. Moves main pipe to CPU before subprocess to free GPU memory, restores after."""
     name = (character_name or "").strip().lower()
     if not _valid_name(name):
         return f"Bad name '{name}'. Must be lowercase alphanumeric."
@@ -418,7 +422,6 @@ def train_character(character_name, photos, max_steps, progress=gr.Progress(trac
     out_dir = LORAS_DIR / name
     progress(0.01, desc=f"Training '{name}' with {n_images} photos...")
 
-    # Free GPU for the training subprocess
     _move_pipe_to("cpu")
 
     cmd = [sys.executable, "/workspace/app/train_lora.py", name, str(images_dir),
@@ -438,7 +441,6 @@ def train_character(character_name, photos, max_steps, progress=gr.Progress(trac
         proc.wait()
         rc = proc.returncode
     finally:
-        # Bring the main pipe back to GPU for subsequent swap requests
         _move_pipe_to("cuda")
 
     lora_file = out_dir / "pytorch_lora_weights.safetensors"
@@ -473,7 +475,7 @@ with gr.Blocks(title="Easy Face Swap (Cloud)") as demo:
         btn.click(swap_batch, [source, source_extras, targets, character_lora], [gallery, status])
         refresh_btn.click(refresh_lora_list, [], [character_lora])
     with gr.Tab("Train Character"):
-        gr.Markdown("**Train a character LoRA.** Pick a short name (e.g. `baileyy`), drop 15-50 clear face photos.")
+        gr.Markdown("**Train a character LoRA.**")
         train_name = gr.Textbox(label="Character name (lowercase, alphanumeric)", placeholder="e.g. baileyy")
         train_photos = gr.Files(label="Training photos (15-50)", file_types=["image"], file_count="multiple")
         train_steps = gr.Slider(label="Training steps", minimum=400, maximum=2000, value=1200, step=100)
