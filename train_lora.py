@@ -69,10 +69,8 @@ def main():
 
     env = os.environ.copy()
     env["HF_HOME"] = "/workspace/hf_cache"
-    # MKL/OpenMP conflict workaround for bitsandbytes
     env["MKL_THREADING_LAYER"] = "GNU"
     env["MKL_SERVICE_FORCE_INTEL"] = "1"
-    # Reduce CUDA fragmentation for the save step
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:512"
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -89,3 +87,7 @@ def main():
     else:
         print(f"[train_lora] FAILED (rc={rc})", flush=True)
         sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
