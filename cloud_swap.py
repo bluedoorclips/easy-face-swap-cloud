@@ -72,14 +72,16 @@ STRENGTH = 0.60
 STEPS    = 32
 GUIDANCE = 2.5
 
-# LoRA scale: SPLIT between Swap (InstantID handles identity) and Generate (LoRA is the only identity source)
-LORA_SCALE_SWAP     = 0.85  # Swap pipe — InstantID provides identity, LoRA assists
-LORA_SCALE_GENERATE = 1.05  # T2I pipe — LoRA is the ONLY identity source, needs to be strong
+LORA_SCALE_SWAP     = 0.85
+LORA_SCALE_GENERATE = 1.05
 IP_SCALE_WITH_LORA  = 0.5
 CN_SCALE_WITH_LORA  = 0.65
 
 T2I_STEPS    = 30
 T2I_GUIDANCE = 2.0
+
+# Default post-processing filter strength (0=off, 1=max). Adjustable per-generation via UI slider.
+PHONE_FILTER_DEFAULT = 0.6
 
 TARGET_SIM   = 0.55
 MAX_ATTEMPTS = 2
@@ -157,6 +159,47 @@ except Exception:
 
 _current_lora = {"name": None}
 print("Ready.", flush=True)
+
+
+def apply_phone_filter(img_bgr, strength=0.6):
+    """Post-process AI output to look more like a real phone photo.
+    - Compresses specular highlights (matte effect)
+    - Adds ISO grain (especially in mid-tones)
+    - Slight desaturation
+    - Subtle warm tint (typical of phone JPEG output)
+
+    strength: 0=no effect (raw AI), 1=heavy filter
+    """
+    if strength <= 0 or img_bgr is None:
+        return img_bgr
+    s = float(np.clip(strength, 0, 1))
+    img = img_bgr.astype(np.float32)
+
+    # 1. Compress highlights — values above 200 get squashed toward 220
+    #    This kills the "glowing AI skin highlights" look
+    threshold = 200
+    over = np.maximum(img - threshold, 0)
+    compression = 1.0 - 0.45 * s  # at s=1 highlights compressed 45%
+    img = np.minimum(img, threshold) + over * compression
+
+    # 2. Add ISO grain — Gaussian noise scaled by strength
+    grain_std = 3.0 * s
+    noise = np.random.normal(0, grain_std, img.shape).astype(np.float32)
+    img = img + noise
+
+    # 3. Slight desaturation (real phones aren't as saturated as SDXL)
+    desat = 1.0 - 0.08 * s  # 8% saturation reduction at full strength
+    img_u8 = np.clip(img, 0, 255).astype(np.uint8)
+    hsv = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[..., 1] = hsv[..., 1] * desat
+    hsv[..., 1] = np.clip(hsv[..., 1], 0, 255)
+    img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
+
+    # 4. Subtle warm tint shift
+    warm = np.array([0, 1.5, 3.0]) * s  # BGR: more red, slightly more green
+    img = img + warm
+
+    return np.clip(img, 0, 255).astype(np.uint8)
 
 
 def _move_pipe_to(device):
@@ -321,7 +364,7 @@ def compute_source_embedding(source_images):
     return np.mean(np.stack(embs, axis=0), axis=0)
 
 
-def swap_one(source_emb, target_path, lora_name=None):
+def swap_one(source_emb, target_path, lora_name=None, filter_strength=PHONE_FILTER_DEFAULT):
     if not _PIPE_ON_GPU:
         _move_pipe_to("cuda")
     target_bgr = load_image_bgr(target_path)
@@ -399,6 +442,9 @@ def swap_one(source_emb, target_path, lora_name=None):
     except cv2.error:
         soft = cv2.GaussianBlur(mask.astype(np.float32)/255.0, (0,0), 18)[..., np.newaxis]
         result_bgr[sy1:sy2, sx1:sx2] = (gen_bgr.astype(np.float32) * soft + crop_orig.astype(np.float32) * (1-soft)).astype(np.uint8)
+
+    # Apply phone-photo filter to final output
+    result_bgr = apply_phone_filter(result_bgr, strength=filter_strength)
     return result_bgr, best_sim
 
 
@@ -465,7 +511,7 @@ def deformity_check(image_bgr):
     return True, "ok"
 
 
-def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, use_random_scenes, steps, guidance, progress=gr.Progress(track_tqdm=False)):
+def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, use_random_scenes, steps, guidance, filter_strength, progress=gr.Progress(track_tqdm=False)):
     chars = load_characters()
     character = parse_char_choice(character)
 
@@ -526,6 +572,8 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
             ok, reason = deformity_check(img_bgr)
             tag = "OK" if ok else f"FAIL ({reason})"
             pass_log.append(tag)
+            # Apply phone filter to the final output
+            img_bgr = apply_phone_filter(img_bgr, strength=float(filter_strength))
             stem = f"t2i_{character or 'free'}_{i:02d}_seed{seed}"
             if ok:
                 p = out_dir / f"{stem}.png"
@@ -719,6 +767,8 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
                 t2i_n = gr.Slider(label="How many images", minimum=1, maximum=20, value=10, step=1)
                 t2i_aspect = gr.Dropdown(label="Aspect", value="832x1216 (portrait)",
                                          choices=["832x1216 (portrait)", "1024x1024 (square)", "1216x832 (landscape)"])
+                t2i_filter = gr.Slider(label="Phone-photo filter (0=raw AI, 1=heavy matte)",
+                                       minimum=0.0, maximum=1.0, value=PHONE_FILTER_DEFAULT, step=0.05)
                 with gr.Accordion("Advanced", open=False):
                     t2i_steps = gr.Slider(label="Steps", minimum=15, maximum=50, value=T2I_STEPS, step=1)
                     t2i_guidance = gr.Slider(label="Prompt strictness (lower = more natural)", minimum=1.0, maximum=8.0, value=T2I_GUIDANCE, step=0.1)
@@ -727,7 +777,7 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
                 t2i_gallery = gr.Gallery(label="Results (only deformity-passed shown)", columns=2, height=500)
                 t2i_status = gr.Markdown("")
         t2i_btn.click(generate_images,
-                      [t2i_char, t2i_scenario, t2i_n, t2i_aspect, t2i_nsfw, t2i_random, t2i_steps, t2i_guidance],
+                      [t2i_char, t2i_scenario, t2i_n, t2i_aspect, t2i_nsfw, t2i_random, t2i_steps, t2i_guidance, t2i_filter],
                       [t2i_gallery, t2i_status])
 
     with gr.Tab("Approve & Swap"):
