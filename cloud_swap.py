@@ -72,9 +72,11 @@ STRENGTH = 0.60
 STEPS    = 32
 GUIDANCE = 2.5
 
-LORA_SCALE         = 0.85
-IP_SCALE_WITH_LORA = 0.5
-CN_SCALE_WITH_LORA = 0.65
+# LoRA scale: SPLIT between Swap (InstantID handles identity) and Generate (LoRA is the only identity source)
+LORA_SCALE_SWAP     = 0.85  # Swap pipe — InstantID provides identity, LoRA assists
+LORA_SCALE_GENERATE = 1.05  # T2I pipe — LoRA is the ONLY identity source, needs to be strong
+IP_SCALE_WITH_LORA  = 0.5
+CN_SCALE_WITH_LORA  = 0.65
 
 T2I_STEPS    = 30
 T2I_GUIDANCE = 2.0
@@ -347,7 +349,7 @@ def swap_one(source_emb, target_path, lora_name=None):
 
     if lora_name:
         prompt = f"a photo of {lora_name} woman, " + BASE_PROMPT_SUFFIX
-        cross_attn = {"scale": LORA_SCALE}
+        cross_attn = {"scale": LORA_SCALE_SWAP}
         ip = IP_SCALE_WITH_LORA
         cn = CN_SCALE_WITH_LORA
     else:
@@ -483,7 +485,7 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
         ensure_lora_loaded(lora_name)
     except Exception as e:
         return [], f"LoRA load error: {e}"
-    cross_attn = {"scale": LORA_SCALE} if lora_name else None
+    cross_attn = {"scale": LORA_SCALE_GENERATE} if lora_name else None
 
     aspect_map = {
         "832x1216 (portrait)": (832, 1216),
