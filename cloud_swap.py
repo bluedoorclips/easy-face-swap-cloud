@@ -1,7 +1,7 @@
 """
 Easy Face Swap v2 — cloud edition.
 """
-import os, sys, time, traceback, subprocess, shutil, json, gc, random
+import os, sys, time, traceback, subprocess, shutil, json, gc, random, base64, io
 from pathlib import Path
 
 CRASH_LOG = "/workspace/v2_startup_error.log"
@@ -36,6 +36,14 @@ try:
     from diffusers.models import ControlNetModel
 except Exception:
     _log_crash_and_reraise("imports")
+
+# Optional: anthropic SDK for Claude Haiku batch judging
+try:
+    import anthropic
+    _HAS_ANTHROPIC = True
+except Exception:
+    _HAS_ANTHROPIC = False
+    print("[anthropic] SDK not installed - Smart Swap will use math-based judging", flush=True)
 
 try:
     import pillow_heif
@@ -83,10 +91,12 @@ T2I_GUIDANCE = 2.0
 PHONE_FILTER_DEFAULT = 0.6
 
 TARGET_SIM   = 0.55
-MAX_ATTEMPTS = 3  # bumped from 2 -> 3: each image gets 3 swap attempts, best one kept
+MAX_ATTEMPTS = 3
 GEN_SIZE     = 1024
 MAX_INPUT_DIM = 2048
 CROP_PAD     = 1.35
+
+SMART_SWAP_VARIATIONS = 3  # Number of swap variations per target photo
 
 BASE_PROMPT_SUFFIX = "candid amateur iPhone photograph, matte skin without makeup highlights, real skin texture with pores and minor blemishes, natural skin tone, no retouching, no filter, slight ISO grain, soft uneven lighting"
 
@@ -103,6 +113,9 @@ NEG_PROMPT = (
     "hair artifact, dark line on face, hair bleeding into skin, "
     "extra limbs, ugly, blurry, lowres, fake, oversaturated, posterized"
 )
+
+# Runtime storage for the user-provided Anthropic API key (set via Smart Swap tab textbox)
+_ANTHROPIC_KEY = {"value": os.environ.get("ANTHROPIC_API_KEY", "")}
 
 print("=" * 60)
 print("Easy Face Swap v2 (cloud) — loading...")
@@ -345,7 +358,8 @@ def compute_source_embedding(source_images):
     return np.mean(np.stack(embs, axis=0), axis=0)
 
 
-def swap_one(source_emb, target_path, lora_name=None, filter_strength=PHONE_FILTER_DEFAULT):
+def swap_one_single(source_emb, target_path, lora_name=None, seed_offset=0, filter_strength=PHONE_FILTER_DEFAULT):
+    """Single swap attempt — no retry loop, used by smart_swap to produce N variations."""
     if not _PIPE_ON_GPU:
         _move_pipe_to("cuda")
     target_bgr = load_image_bgr(target_path)
@@ -382,36 +396,31 @@ def swap_one(source_emb, target_path, lora_name=None, filter_strength=PHONE_FILT
         ip = IP_SCALE
         cn = CN_SCALE
 
-    best = None; best_sim = -1.0; cur_ip = ip
-    for attempt in range(MAX_ATTEMPTS):
-        pipe.set_ip_adapter_scale(cur_ip)
-        seed = int(time.time()*1000) % (2**31) + attempt*7919
-        gen = torch.Generator(device="cuda").manual_seed(seed)
-        result = pipe(
-            prompt=prompt, negative_prompt=NEG_PROMPT,
-            image=crop_pil, control_image=kps_image,
-            image_embeds=torch.from_numpy(source_emb).unsqueeze(0),
-            strength=STRENGTH, controlnet_conditioning_scale=cn,
-            num_inference_steps=STEPS, guidance_scale=GUIDANCE,
-            width=GEN_SIZE, height=GEN_SIZE, generator=gen,
-            cross_attention_kwargs=cross_attn,
-        ).images[0]
-        gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
-        if best is None or best.size == 0:
-            best = gen_full
-        gf = face_app.get(gen_full)
-        if gf:
-            biggest = max(gf, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-            src_norm = source_emb / (np.linalg.norm(source_emb) + 1e-9)
-            sim = cosine_sim(src_norm, biggest.normed_embedding)
-        else:
-            sim = -1.0
-        if sim > best_sim:
-            best_sim = sim; best = gen_full
-        if sim >= TARGET_SIM: break
-        cur_ip = min(1.0, cur_ip + 0.05)
+    pipe.set_ip_adapter_scale(ip)
+    seed = int(time.time()*1000) % (2**31) + seed_offset*7919 + random.randint(0, 1000)
+    gen = torch.Generator(device="cuda").manual_seed(seed)
+    result = pipe(
+        prompt=prompt, negative_prompt=NEG_PROMPT,
+        image=crop_pil, control_image=kps_image,
+        image_embeds=torch.from_numpy(source_emb).unsqueeze(0),
+        strength=STRENGTH, controlnet_conditioning_scale=cn,
+        num_inference_steps=STEPS, guidance_scale=GUIDANCE,
+        width=GEN_SIZE, height=GEN_SIZE, generator=gen,
+        cross_attention_kwargs=cross_attn,
+    ).images[0]
+    gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
 
-    gen_bgr = cv2.resize(best, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
+    # Compute face similarity for the math-based judge fallback
+    gf = face_app.get(gen_full)
+    if gf:
+        biggest = max(gf, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+        src_norm = source_emb / (np.linalg.norm(source_emb) + 1e-9)
+        sim = cosine_sim(src_norm, biggest.normed_embedding)
+    else:
+        sim = -1.0
+
+    # Composite the gen back onto the original target image
+    gen_bgr = cv2.resize(gen_full, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
     result_bgr = target_bgr.copy()
     crop_orig = result_bgr[sy1:sy2, sx1:sx2].copy()
     mask = np.zeros((ch, cw), dtype=np.uint8)
@@ -425,7 +434,24 @@ def swap_one(source_emb, target_path, lora_name=None, filter_strength=PHONE_FILT
         result_bgr[sy1:sy2, sx1:sx2] = (gen_bgr.astype(np.float32) * soft + crop_orig.astype(np.float32) * (1-soft)).astype(np.uint8)
 
     result_bgr = apply_phone_filter(result_bgr, strength=filter_strength)
-    return result_bgr, best_sim
+    return result_bgr, sim
+
+
+def swap_one(source_emb, target_path, lora_name=None, filter_strength=PHONE_FILTER_DEFAULT):
+    """Original swap with internal MAX_ATTEMPTS retry loop, picks best by face sim."""
+    best = None; best_sim = -1.0
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            out_bgr, sim = swap_one_single(source_emb, target_path, lora_name, seed_offset=attempt, filter_strength=filter_strength)
+        except Exception as e:
+            if attempt == MAX_ATTEMPTS - 1 and best is None:
+                raise
+            continue
+        if sim > best_sim:
+            best_sim = sim; best = out_bgr
+        if sim >= TARGET_SIM:
+            break
+    return best, best_sim
 
 
 def swap_batch(source_img, source_extras, target_files, character_lora, progress=gr.Progress(track_tqdm=False)):
@@ -475,6 +501,164 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
     msg = f"Done: {len(results)} swapped → {run_dir}"
     if failed:
         msg += "\n\nSkipped:\n" + "\n".join(failed[:10])
+    return results, msg
+
+
+# ============ SMART SWAP — Claude Haiku judges best of N variations ============
+
+def _encode_jpeg_b64(img_bgr, max_dim=1024):
+    """Encode BGR image to base64 JPEG for Claude API. Downscales if too big."""
+    h, w = img_bgr.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        img_bgr = cv2.resize(img_bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil = Image.fromarray(img_rgb)
+    buf = io.BytesIO()
+    pil.save(buf, format="JPEG", quality=85)
+    return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+
+
+def claude_pick_best(images_bgr, anthropic_key=None):
+    """Ask Claude Haiku to pick the most realistic image from a list. Returns index 0..N-1.
+    Falls back to first image if API unavailable or fails."""
+    if not _HAS_ANTHROPIC or not images_bgr:
+        return 0
+    key = anthropic_key or _ANTHROPIC_KEY.get("value") or os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        return 0  # No key = no judging
+    try:
+        client = anthropic.Anthropic(api_key=key)
+        content = [{
+            "type": "text",
+            "text": (
+                f"You are judging {len(images_bgr)} variants of a face-swapped photograph. "
+                "Pick the one that looks MOST like a real photograph (matte skin, natural lighting, "
+                "no obvious AI artifacts like hair-on-forehead, deformed features, plastic skin, "
+                "or unnatural glow). "
+                f"Reply with ONLY the number 1 through {len(images_bgr)}. No explanation."
+            )
+        }]
+        for img in images_bgr:
+            b64 = _encode_jpeg_b64(img)
+            content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}
+            })
+
+        msg = client.messages.create(
+            model="claude-3-5-haiku-latest",
+            max_tokens=10,
+            messages=[{"role": "user", "content": content}]
+        )
+        text = msg.content[0].text.strip()
+        # Parse first digit
+        for ch in text:
+            if ch.isdigit():
+                idx = int(ch) - 1
+                if 0 <= idx < len(images_bgr):
+                    return idx
+        return 0
+    except Exception as e:
+        print(f"[claude-judge] failed: {e}, falling back to index 0", flush=True)
+        return 0
+
+
+def smart_swap_batch(anthropic_key, source_img, target_files, character_lora, progress=gr.Progress(track_tqdm=False)):
+    """Smart Swap: filter face-photos, do N variations each, Claude picks best."""
+    # Save key for future calls
+    if anthropic_key:
+        _ANTHROPIC_KEY["value"] = anthropic_key.strip()
+
+    if source_img is None:
+        return None, "Drop a source face first (top left of this tab)."
+    if not target_files:
+        return None, "Drop at least one target photo."
+
+    lora_name = parse_char_choice(character_lora)
+    try:
+        ensure_lora_loaded(lora_name if lora_name else None)
+    except Exception as e:
+        return None, f"LoRA load error: {e}"
+
+    try:
+        source_emb = compute_source_embedding([source_img])
+    except Exception as e:
+        return None, f"Source image error: {e}"
+    if source_emb is None:
+        return None, "No face detected in your source photo."
+
+    run_dir = OUTPUT_DIR / time.strftime("%Y%m%d_%H%M%S_smart")
+    run_dir.mkdir(exist_ok=True)
+
+    # Phase 1: filter to photos with faces
+    face_photos = []
+    skipped = []
+    total = len(target_files)
+    for i, f in enumerate(target_files):
+        progress(i / (total * 2), desc=f"Filtering {i+1}/{total}")
+        path = f if isinstance(f, str) else f.name
+        try:
+            img_bgr = load_image_bgr(path)
+            if biggest_face(img_bgr) is not None:
+                face_photos.append(path)
+            else:
+                skipped.append(f"{Path(path).name}: no face detected")
+        except Exception as e:
+            skipped.append(f"{Path(path).name}: {e}")
+
+    if not face_photos:
+        return None, f"None of the {total} photos contained a detectable face."
+
+    # Phase 2: for each face-photo, swap N times + Claude picks best
+    results = []
+    judge_log = []
+    use_claude = _HAS_ANTHROPIC and bool(_ANTHROPIC_KEY["value"])
+    judge_name = "Claude Haiku" if use_claude else "face-sim score"
+
+    for i, path in enumerate(face_photos):
+        prog_frac = 0.5 + (i / (len(face_photos) * 2))
+        progress(prog_frac, desc=f"Swapping {i+1}/{len(face_photos)} ({SMART_SWAP_VARIATIONS} variations)")
+        variations = []
+        sims = []
+        for v in range(SMART_SWAP_VARIATIONS):
+            try:
+                out_bgr, sim = swap_one_single(source_emb, path, lora_name or None, seed_offset=v)
+                variations.append(out_bgr)
+                sims.append(sim)
+            except Exception as e:
+                print(f"[smart-swap variation {v}] {Path(path).name}: {e}", flush=True)
+
+        if not variations:
+            judge_log.append(f"  {Path(path).name}: ALL VARIATIONS FAILED")
+            continue
+
+        # Pick best variation
+        if use_claude and len(variations) > 1:
+            best_idx = claude_pick_best(variations, anthropic_key=_ANTHROPIC_KEY["value"])
+            judge_log.append(f"  {Path(path).name}: {len(variations)} variants, Claude picked #{best_idx+1}")
+        elif len(variations) > 1:
+            best_idx = int(np.argmax(sims))
+            judge_log.append(f"  {Path(path).name}: {len(variations)} variants, math picked #{best_idx+1} (sim {sims[best_idx]:.2f})")
+        else:
+            best_idx = 0
+            judge_log.append(f"  {Path(path).name}: only 1 variant succeeded")
+
+        # Save the chosen one
+        stem = Path(path).stem
+        out_path = run_dir / f"smart_{i:03d}_{stem}.png"
+        cv2.imwrite(str(out_path), variations[best_idx])
+        results.append(str(out_path))
+
+    msg = (f"**Smart Swap done**\n\n"
+           f"- Photos in: {total}\n"
+           f"- With face: {len(face_photos)}\n"
+           f"- Swapped: {len(results)}\n"
+           f"- Judge: {judge_name}\n"
+           f"- Output dir: `{run_dir}`\n\n"
+           f"**Per-image:**\n" + "\n".join(judge_log[:30]))
+    if skipped:
+        msg += f"\n\n**Skipped (no face):**\n" + "\n".join(skipped[:10])
     return results, msg
 
 
@@ -701,9 +885,11 @@ def show_status():
     loras = list_loras()
     staged = list_staged()
     chars = load_characters()
+    has_anthropic = "yes" if _ANTHROPIC_KEY["value"] else "no (Smart Swap will use math judging)"
     return (f"**Trained LoRAs ({len(loras)}):** {', '.join(loras) if loras else '(none)'}\n\n"
             f"**Staged but not trained:** {', '.join(staged) if staged else '(none)'}\n\n"
-            f"**Characters in library ({len(chars)}):** {', '.join(sorted(chars.keys())) if chars else '(none)'}")
+            f"**Characters in library ({len(chars)}):** {', '.join(sorted(chars.keys())) if chars else '(none)'}\n\n"
+            f"**Anthropic key loaded:** {has_anthropic}")
 
 
 def refresh_all_dropdowns():
@@ -714,11 +900,35 @@ def refresh_all_dropdowns():
             gr.update(choices=chars_and_loras, value="(none)"),
             gr.update(choices=char_edit, value="(new)"),
             gr.update(choices=loras, value="(none)"),
-            gr.update(choices=chars_and_loras, value="(none)"))
+            gr.update(choices=chars_and_loras, value="(none)"),
+            gr.update(choices=loras, value="(none)"))
 
 
 with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
     gr.Markdown("# Easy Face Swap — Cloud v2")
+
+    with gr.Tab("Smart Swap"):
+        gr.Markdown("**Easiest workflow.** Drop a bunch of photos, pick a character, hit Smart Swap. "
+                    "I filter face-photos automatically, run 3 variations per photo, and pick the most realistic one. "
+                    "(Claude Haiku judges if you provide an API key, otherwise face-similarity math is used.)")
+        with gr.Row():
+            with gr.Column():
+                smart_anthropic = gr.Textbox(label="Anthropic API Key (optional — kept in memory only, paste once)",
+                                             type="password",
+                                             placeholder="sk-ant-api03-...",
+                                             value=("***SAVED***" if _ANTHROPIC_KEY["value"] else ""))
+                smart_source = gr.Image(label="Source face (your face) — drag here", type="numpy", height=300)
+                smart_char = gr.Dropdown(label="Character LoRA (optional)",
+                                         choices=["(none)"] + list_loras(), value="(none)")
+            with gr.Column():
+                smart_targets = gr.Files(label="Target photos — drop a bunch (real photos, sfw or nsfw)",
+                                         file_types=["image"], file_count="multiple")
+        smart_btn = gr.Button("Smart Swap All", variant="primary", size="lg")
+        smart_status = gr.Markdown("")
+        smart_gallery = gr.Gallery(label="Best of each batch (one per face-photo)", columns=3, height=600)
+        smart_btn.click(smart_swap_batch,
+                        [smart_anthropic, smart_source, smart_targets, smart_char],
+                        [smart_gallery, smart_status])
 
     with gr.Tab("Swap"):
         gr.Markdown("Drop source face, target images, optionally pick a trained character.")
@@ -808,7 +1018,7 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
         status_md = gr.Markdown(show_status())
         status_btn.click(show_status, [], [status_md]).then(
             refresh_all_dropdowns, [],
-            [swap_lora, t2i_char, char_edit_select, char_form_lora, approval_char]
+            [swap_lora, t2i_char, char_edit_select, char_form_lora, approval_char, smart_char]
         )
 
 
