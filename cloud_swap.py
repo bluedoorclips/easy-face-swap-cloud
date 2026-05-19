@@ -42,7 +42,7 @@ try:
     _HAS_ANTHROPIC = True
 except Exception:
     _HAS_ANTHROPIC = False
-    print("[anthropic] SDK not installed - Smart Swap will use math-based judging", flush=True)
+    print("[anthropic] SDK not installed", flush=True)
 
 try:
     import pillow_heif
@@ -75,11 +75,12 @@ BASE_MODEL = "SG161222/RealVisXL_V4.0"
 
 IP_SCALE = 0.85
 CN_SCALE = 0.80
-STRENGTH = 0.60
+# KEY CHANGE: STRENGTH 0.60 -> 0.42. Less denoising = more of the ORIGINAL real photo
+# preserved = original skin texture/lighting kept = less AI sheen.
+STRENGTH = 0.42
 STEPS    = 32
 GUIDANCE = 2.5
 
-# Bumped for stronger identity in swap (was 0.85 / 0.5)
 LORA_SCALE_SWAP     = 1.0
 LORA_SCALE_GENERATE = 1.05
 IP_SCALE_WITH_LORA  = 0.65
@@ -88,8 +89,7 @@ CN_SCALE_WITH_LORA  = 0.65
 T2I_STEPS    = 30
 T2I_GUIDANCE = 2.0
 
-# Bumped from 0.6 — more aggressive anti-shine
-PHONE_FILTER_DEFAULT = 0.75
+PHONE_FILTER_DEFAULT = 0.85
 
 TARGET_SIM   = 0.55
 MAX_ATTEMPTS = 3
@@ -500,8 +500,6 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
     return results, msg
 
 
-# ============ SMART SWAP — Claude Haiku judges best of N variations ============
-
 def _encode_jpeg_b64(img_bgr, max_dim=1024):
     h, w = img_bgr.shape[:2]
     if max(h, w) > max_dim:
@@ -515,8 +513,6 @@ def _encode_jpeg_b64(img_bgr, max_dim=1024):
 
 
 def claude_pick_best(images_bgr, anthropic_key=None, reference_bgr=None):
-    """Ask Claude Haiku to pick the most aimee-like + realistic variation.
-    If reference_bgr provided, Claude compares variants to that reference face."""
     if not _HAS_ANTHROPIC or not images_bgr:
         return 0
     key = anthropic_key or _ANTHROPIC_KEY.get("value") or os.environ.get("ANTHROPIC_API_KEY", "")
@@ -602,7 +598,6 @@ def smart_swap_batch(anthropic_key, source_img, target_files, character_lora, pr
     if source_emb is None:
         return None, "No face detected in your source photo."
 
-    # Convert source_img (RGB numpy) to BGR for Claude reference
     try:
         ref_bgr = cv2.cvtColor(source_img, cv2.COLOR_RGB2BGR) if source_img is not None else None
     except Exception:
@@ -965,37 +960,34 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
         with gr.Row():
             with gr.Column():
                 t2i_char = gr.Dropdown(label="Character", choices=["(none)"] + list_chars_and_loras(), value="(none)")
-                t2i_scenario = gr.Textbox(label="Custom scene (used if 'Random scenes' is OFF)", lines=2,
-                                          placeholder="e.g. at the beach in a white bikini at sunset")
-                t2i_random = gr.Checkbox(label="Use random scenes from library (recommended)", value=True)
+                t2i_scenario = gr.Textbox(label="Custom scene", lines=2)
+                t2i_random = gr.Checkbox(label="Use random scenes from library", value=True)
                 t2i_nsfw = gr.Radio(label="NSFW level", choices=["off", "tasteful", "explicit"], value="off")
                 t2i_n = gr.Slider(label="How many images", minimum=1, maximum=20, value=10, step=1)
                 t2i_aspect = gr.Dropdown(label="Aspect", value="832x1216 (portrait)",
                                          choices=["832x1216 (portrait)", "1024x1024 (square)", "1216x832 (landscape)"])
-                t2i_filter = gr.Slider(label="Phone-photo filter (0=raw AI, 1=heavy matte)",
-                                       minimum=0.0, maximum=1.0, value=PHONE_FILTER_DEFAULT, step=0.05)
+                t2i_filter = gr.Slider(label="Phone-photo filter", minimum=0.0, maximum=1.0, value=PHONE_FILTER_DEFAULT, step=0.05)
                 with gr.Accordion("Advanced", open=False):
                     t2i_steps = gr.Slider(label="Steps", minimum=15, maximum=50, value=T2I_STEPS, step=1)
-                    t2i_guidance = gr.Slider(label="Prompt strictness (lower = more natural)", minimum=1.0, maximum=8.0, value=T2I_GUIDANCE, step=0.1)
+                    t2i_guidance = gr.Slider(label="Prompt strictness", minimum=1.0, maximum=8.0, value=T2I_GUIDANCE, step=0.1)
                 t2i_btn = gr.Button("Generate", variant="primary", size="lg")
             with gr.Column():
-                t2i_gallery = gr.Gallery(label="Results (only deformity-passed shown)", columns=2, height=500)
+                t2i_gallery = gr.Gallery(label="Results", columns=2, height=500)
                 t2i_status = gr.Markdown("")
         t2i_btn.click(generate_images,
                       [t2i_char, t2i_scenario, t2i_n, t2i_aspect, t2i_nsfw, t2i_random, t2i_steps, t2i_guidance, t2i_filter],
                       [t2i_gallery, t2i_status])
 
     with gr.Tab("Approve & Swap"):
-        gr.Markdown("Drag approved images into the box, pick the same character, run face-swap pipeline.")
         with gr.Row():
             with gr.Column():
                 approval_char = gr.Dropdown(label="Character", choices=["(none)"] + list_chars_and_loras(), value="(none)")
-                approval_source = gr.Image(label="Source face (optional)", type="numpy", height=300)
-                approval_images = gr.Files(label="Approved images — drag-drop or click", file_types=["image"], file_count="multiple")
+                approval_source = gr.Image(label="Source face", type="numpy", height=300)
+                approval_images = gr.Files(label="Approved images", file_types=["image"], file_count="multiple")
             with gr.Column():
                 approval_status = gr.Markdown("")
                 approval_gallery = gr.Gallery(label="Refined results", columns=2, height=500)
-        approval_btn = gr.Button("Swap approved images", variant="primary", size="lg")
+        approval_btn = gr.Button("Swap approved", variant="primary", size="lg")
         approval_btn.click(swap_batch,
                            [approval_source, gr.State(None), approval_images, approval_char],
                            [approval_gallery, approval_status])
@@ -1004,10 +996,10 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
         with gr.Row():
             with gr.Column():
                 char_edit_select = gr.Dropdown(label="Edit existing or (new)", choices=["(new)"] + list_characters(), value="(new)")
-                char_name = gr.Textbox(label="Character name (lowercase, alphanumeric)")
+                char_name = gr.Textbox(label="Character name")
                 char_traits = gr.Textbox(label="Physical traits", lines=2)
-                char_neg = gr.Textbox(label="Negative traits to avoid", lines=1)
-                char_form_lora = gr.Dropdown(label="LoRA to use", choices=["(none)"] + list_loras(), value="(none)")
+                char_neg = gr.Textbox(label="Negative traits", lines=1)
+                char_form_lora = gr.Dropdown(label="LoRA", choices=["(none)"] + list_loras(), value="(none)")
                 with gr.Row():
                     save_char_btn = gr.Button("Save character", variant="primary")
                     delete_char_btn = gr.Button("Delete")
@@ -1020,7 +1012,7 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
 
     with gr.Tab("Train"):
         train_name = gr.Textbox(label="Character name")
-        train_photos = gr.Files(label="Training photos (15-50) — drag-drop or click", file_types=["image"], file_count="multiple")
+        train_photos = gr.Files(label="Training photos (15-50)", file_types=["image"], file_count="multiple")
         train_steps = gr.Slider(label="Training steps", minimum=400, maximum=2000, value=1200, step=100)
         with gr.Row():
             stage_btn = gr.Button("Stage photos only (fast)")
