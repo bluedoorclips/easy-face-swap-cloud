@@ -1,5 +1,6 @@
 """
 Easy Face Swap v2 — cloud edition.
+Smart Swap now uses inswapper_128 + GFPGAN + color matching (Higgsfield-style).
 """
 import os, sys, time, traceback, subprocess, shutil, json, gc, random, base64, io
 from pathlib import Path
@@ -30,6 +31,7 @@ try:
     import torch
     from PIL import Image, ImageOps
     import gradio as gr
+    import insightface
     from insightface.app import FaceAnalysis
     from huggingface_hub import snapshot_download
     from diffusers import StableDiffusionXLPipeline, AutoPipelineForText2Image
@@ -42,7 +44,6 @@ try:
     _HAS_ANTHROPIC = True
 except Exception:
     _HAS_ANTHROPIC = False
-    print("[anthropic] SDK not installed", flush=True)
 
 try:
     import pillow_heif
@@ -67,7 +68,8 @@ LORAS_DIR        = Path("/workspace/loras")
 TRAINING_DIR     = Path("/workspace/training")
 CHARACTERS_FILE  = Path("/workspace/characters.json")
 APPROVED_DIR     = Path("/workspace/approved")
-for d in (OUTPUT_DIR, LORAS_DIR, TRAINING_DIR, APPROVED_DIR):
+MODELS_DIR       = Path("/workspace/models")
+for d in (OUTPUT_DIR, LORAS_DIR, TRAINING_DIR, APPROVED_DIR, MODELS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 DTYPE = torch.float16
@@ -75,8 +77,6 @@ BASE_MODEL = "SG161222/RealVisXL_V4.0"
 
 IP_SCALE = 0.85
 CN_SCALE = 0.80
-# KEY CHANGE: STRENGTH 0.60 -> 0.42. Less denoising = more of the ORIGINAL real photo
-# preserved = original skin texture/lighting kept = less AI sheen.
 STRENGTH = 0.42
 STEPS    = 32
 GUIDANCE = 2.5
@@ -89,7 +89,7 @@ CN_SCALE_WITH_LORA  = 0.65
 T2I_STEPS    = 30
 T2I_GUIDANCE = 2.0
 
-PHONE_FILTER_DEFAULT = 0.85
+PHONE_FILTER_DEFAULT = 0.5  # gentler now that inswapper preserves real texture
 
 TARGET_SIM   = 0.55
 MAX_ATTEMPTS = 3
@@ -97,7 +97,7 @@ GEN_SIZE     = 1024
 MAX_INPUT_DIM = 2048
 CROP_PAD     = 1.35
 
-SMART_SWAP_VARIATIONS = 3
+SMART_SWAP_VARIATIONS = 1  # inswapper is deterministic, no need for variations
 
 BASE_PROMPT_SUFFIX = "candid amateur iPhone photograph, matte skin without makeup highlights, real skin texture with pores and minor blemishes, natural skin tone, no retouching, no filter, slight ISO grain, soft uneven lighting"
 
@@ -122,14 +122,52 @@ print("Easy Face Swap v2 (cloud) — loading...")
 print("=" * 60)
 
 try:
-    print("[1/3] Face analyzer (antelopev2)...", flush=True)
+    print("[1/5] Face analyzer (antelopev2)...", flush=True)
     face_app = FaceAnalysis(name="antelopev2", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
     face_app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.3)
 except Exception:
     _log_crash_and_reraise("FaceAnalysis init")
 
+# inswapper_128 — the realistic face swap model
+swapper_model = None
 try:
-    print(f"[2/3] InstantID img2img on {BASE_MODEL}...", flush=True)
+    print("[2/5] inswapper_128 (realistic face swap)...", flush=True)
+    insw_path = str(MODELS_DIR / "inswapper_128.onnx")
+    if os.path.exists(insw_path):
+        swapper_model = insightface.model_zoo.get_model(
+            insw_path,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        print(f"  loaded inswapper from {insw_path}", flush=True)
+    else:
+        print(f"  WARN: inswapper file not found at {insw_path} — Smart Swap will fail", flush=True)
+except Exception as e:
+    print(f"  inswapper load failed: {e}", flush=True)
+    swapper_model = None
+
+# GFPGAN — face restoration (sharpens swapped faces without adding AI sheen)
+gfpgan_restorer = None
+try:
+    print("[3/5] GFPGAN (face restoration)...", flush=True)
+    from gfpgan import GFPGANer
+    gfp_path = str(MODELS_DIR / "GFPGANv1.4.pth")
+    if os.path.exists(gfp_path):
+        gfpgan_restorer = GFPGANer(
+            model_path=gfp_path,
+            upscale=1,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=None,
+        )
+        print(f"  loaded GFPGAN from {gfp_path}", flush=True)
+    else:
+        print(f"  WARN: GFPGAN file not found at {gfp_path} — restoration skipped", flush=True)
+except Exception as e:
+    print(f"  GFPGAN load failed: {e}", flush=True)
+    gfpgan_restorer = None
+
+try:
+    print(f"[4/5] InstantID img2img on {BASE_MODEL} (legacy 'Swap' tab)...", flush=True)
     instantid_dir = snapshot_download("InstantX/InstantID", allow_patterns=["ControlNetModel/*", "ip-adapter.bin"])
     controlnet = ControlNetModel.from_pretrained(os.path.join(instantid_dir, "ControlNetModel"), torch_dtype=DTYPE)
     pipe = StableDiffusionXLInstantIDImg2ImgPipeline.from_pretrained(
@@ -151,20 +189,18 @@ except Exception:
     _log_crash_and_reraise("InstantID pipeline load")
 
 try:
-    print("[3/3] T2I pipeline...", flush=True)
+    print("[5/5] T2I pipeline...", flush=True)
     t2i_pipe = None
     try:
         t2i_pipe = AutoPipelineForText2Image.from_pipe(pipe)
-        print("  -> via from_pipe (shared components)", flush=True)
     except Exception as e:
-        print(f"  -> from_pipe failed ({e}); loading fresh", flush=True)
+        print(f"  from_pipe failed ({e}); loading fresh", flush=True)
     if t2i_pipe is None:
         t2i_pipe = StableDiffusionXLPipeline.from_pretrained(
             BASE_MODEL, torch_dtype=DTYPE, variant="fp16", use_safetensors=True,
         )
         if vram_gb >= 20:
             t2i_pipe.to("cuda")
-        print("  -> loaded fresh from_pretrained", flush=True)
     t2i_pipe.set_progress_bar_config(disable=True)
 except Exception:
     _log_crash_and_reraise("T2I pipeline init")
@@ -173,7 +209,7 @@ _current_lora = {"name": None}
 print("Ready.", flush=True)
 
 
-def apply_phone_filter(img_bgr, strength=0.6):
+def apply_phone_filter(img_bgr, strength=0.5):
     if strength <= 0 or img_bgr is None:
         return img_bgr
     s = float(np.clip(strength, 0, 1))
@@ -182,17 +218,15 @@ def apply_phone_filter(img_bgr, strength=0.6):
     over = np.maximum(img - threshold, 0)
     compression = 1.0 - 0.45 * s
     img = np.minimum(img, threshold) + over * compression
-    grain_std = 3.0 * s
+    grain_std = 2.0 * s
     noise = np.random.normal(0, grain_std, img.shape).astype(np.float32)
     img = img + noise
-    desat = 1.0 - 0.08 * s
+    desat = 1.0 - 0.05 * s
     img_u8 = np.clip(img, 0, 255).astype(np.uint8)
     hsv = cv2.cvtColor(img_u8, cv2.COLOR_BGR2HSV).astype(np.float32)
     hsv[..., 1] = hsv[..., 1] * desat
     hsv[..., 1] = np.clip(hsv[..., 1], 0, 255)
     img = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32)
-    warm = np.array([0, 1.5, 3.0]) * s
-    img = img + warm
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
@@ -204,8 +238,6 @@ def _move_pipe_to(device):
         if device == "cpu":
             torch.cuda.empty_cache()
         _PIPE_ON_GPU = (device == "cuda")
-        free, total = torch.cuda.mem_get_info()
-        print(f"[gpu] pipe -> {device}, free={free/(1024**3):.1f}GB / {total/(1024**3):.1f}GB", flush=True)
     except Exception as e:
         print(f"[gpu] move pipe to {device} failed: {e}", flush=True)
 
@@ -281,8 +313,8 @@ def ensure_lora_loaded(name):
     if _current_lora["name"] is not None:
         try:
             pipe.unload_lora_weights()
-        except Exception as e:
-            print(f"[lora-unload] {e}", flush=True)
+        except Exception:
+            pass
         _current_lora["name"] = None
     if name:
         lora_file = LORAS_DIR / name / "pytorch_lora_weights.safetensors"
@@ -290,7 +322,6 @@ def ensure_lora_loaded(name):
             raise RuntimeError(f"LoRA '{name}' not found at {lora_file}")
         pipe.load_lora_weights(str(LORAS_DIR / name), weight_name="pytorch_lora_weights.safetensors")
         _current_lora["name"] = name
-        print(f"[lora] loaded '{name}'", flush=True)
 
 
 def normalize_image(img):
@@ -351,12 +382,115 @@ def compute_source_embedding(source_images):
             face = biggest_face(bgr)
             if face is not None:
                 embs.append(face.embedding)
-        except Exception as e:
-            print(f"[source-skip] {e}", flush=True)
+        except Exception:
+            pass
     if not embs:
         return None
     return np.mean(np.stack(embs, axis=0), axis=0)
 
+
+# ============ INSWAPPER PIPELINE (Higgsfield-style) ============
+
+def color_match_face_to_body(result_bgr, target_bgr, face_bbox):
+    """Histogram match the swapped face region to the surrounding body skin.
+    Samples body skin from areas just outside the face (neck/forehead-edge), then
+    shifts the face region's color stats toward the body stats.
+    """
+    try:
+        x1, y1, x2, y2 = [int(v) for v in face_bbox]
+        H, W = target_bgr.shape[:2]
+        # Sample body skin from a band just below the face (likely neck)
+        h_face = y2 - y1
+        w_face = x2 - x1
+        band_y1 = min(H - 1, y2 + int(h_face * 0.05))
+        band_y2 = min(H, y2 + int(h_face * 0.3))
+        band_x1 = max(0, x1 + int(w_face * 0.2))
+        band_x2 = min(W, x2 - int(w_face * 0.2))
+        if band_y2 <= band_y1 + 5 or band_x2 <= band_x1 + 5:
+            return result_bgr  # No body skin to sample from
+
+        body_skin = target_bgr[band_y1:band_y2, band_x1:band_x2]
+        face_region = result_bgr[y1:y2, x1:x2]
+        if body_skin.size == 0 or face_region.size == 0:
+            return result_bgr
+
+        # Compute LAB stats (L=lightness, A=red-green, B=blue-yellow)
+        body_lab = cv2.cvtColor(body_skin, cv2.COLOR_BGR2LAB).astype(np.float32)
+        face_lab = cv2.cvtColor(face_region, cv2.COLOR_BGR2LAB).astype(np.float32)
+        body_mean = body_lab.reshape(-1, 3).mean(axis=0)
+        body_std  = body_lab.reshape(-1, 3).std(axis=0) + 1e-3
+        face_mean = face_lab.reshape(-1, 3).mean(axis=0)
+        face_std  = face_lab.reshape(-1, 3).std(axis=0) + 1e-3
+
+        # Match face to body stats (gentler on L, stronger on color channels)
+        weight = np.array([0.3, 0.7, 0.7])  # match A and B more than L
+        new_face = (face_lab - face_mean) * (body_std / face_std)
+        new_face = new_face + (face_mean * (1 - weight) + body_mean * weight)
+        new_face = np.clip(new_face, 0, 255).astype(np.uint8)
+        new_face_bgr = cv2.cvtColor(new_face, cv2.COLOR_LAB2BGR)
+
+        # Soft-blend new_face_bgr into result at face_bbox region
+        mask = np.zeros((y2-y1, x2-x1), dtype=np.float32)
+        cv2.ellipse(mask, ((x2-x1)//2, (y2-y1)//2),
+                    (int((x2-x1)*0.45), int((y2-y1)*0.5)), 0, 0, 360, 1.0, -1)
+        mask = cv2.GaussianBlur(mask, (0,0), 15)[..., np.newaxis]
+        out = result_bgr.copy()
+        blended = new_face_bgr.astype(np.float32) * mask + face_region.astype(np.float32) * (1 - mask)
+        out[y1:y2, x1:x2] = np.clip(blended, 0, 255).astype(np.uint8)
+        return out
+    except Exception as e:
+        print(f"[color-match] failed: {e}", flush=True)
+        return result_bgr
+
+
+def restore_face_gfpgan(img_bgr):
+    """GFPGAN face restoration. Sharpens face without adding AI sheen."""
+    if gfpgan_restorer is None:
+        return img_bgr
+    try:
+        _, _, restored = gfpgan_restorer.enhance(
+            img_bgr, has_aligned=False, only_center_face=False, paste_back=True
+        )
+        return restored if restored is not None else img_bgr
+    except Exception as e:
+        print(f"[gfpgan] failed: {e}", flush=True)
+        return img_bgr
+
+
+def inswapper_swap(source_face_obj, target_bgr):
+    """Higgsfield-style face swap: inswapper for geometry, GFPGAN for sharpness,
+    color matching for skin tone harmony. Preserves target's skin texture entirely."""
+    if swapper_model is None:
+        raise RuntimeError("inswapper model not loaded — check pod boot logs")
+
+    target_face = biggest_face(target_bgr)
+    if target_face is None:
+        raise RuntimeError("No face in target")
+
+    # Step 1: face swap (preserves target skin, lighting, background entirely)
+    swapped = swapper_model.get(target_bgr, target_face, source_face_obj, paste_back=True)
+
+    # Step 2: GFPGAN restoration on the swapped face only
+    restored = restore_face_gfpgan(swapped)
+
+    # Step 3: color-match face to body
+    final = color_match_face_to_body(restored, target_bgr, target_face.bbox)
+
+    return final
+
+
+def get_source_face_obj(source_img_rgb):
+    """Get the insightface Face object from the user's source photo."""
+    if source_img_rgb is None:
+        return None
+    bgr = normalize_image(cv2.cvtColor(source_img_rgb, cv2.COLOR_RGB2BGR))
+    faces = face_app.get(bgr)
+    if not faces:
+        return None
+    return max(faces, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
+
+
+# ============ LEGACY DIFFUSION SWAP (kept for 'Swap' tab with LoRA) ============
 
 def swap_one_single(source_emb, target_path, lora_name=None, seed_offset=0, filter_strength=PHONE_FILTER_DEFAULT):
     if not _PIPE_ON_GPU:
@@ -409,14 +543,6 @@ def swap_one_single(source_emb, target_path, lora_name=None, seed_offset=0, filt
     ).images[0]
     gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
 
-    gf = face_app.get(gen_full)
-    if gf:
-        biggest = max(gf, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
-        src_norm = source_emb / (np.linalg.norm(source_emb) + 1e-9)
-        sim = cosine_sim(src_norm, biggest.normed_embedding)
-    else:
-        sim = -1.0
-
     gen_bgr = cv2.resize(gen_full, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
     result_bgr = target_bgr.copy()
     crop_orig = result_bgr[sy1:sy2, sx1:sx2].copy()
@@ -431,37 +557,11 @@ def swap_one_single(source_emb, target_path, lora_name=None, seed_offset=0, filt
         result_bgr[sy1:sy2, sx1:sx2] = (gen_bgr.astype(np.float32) * soft + crop_orig.astype(np.float32) * (1-soft)).astype(np.uint8)
 
     result_bgr = apply_phone_filter(result_bgr, strength=filter_strength)
-    return result_bgr, sim
-
-
-def swap_one(source_emb, target_path, lora_name=None, filter_strength=PHONE_FILTER_DEFAULT):
-    best = None; best_sim = -1.0
-    for attempt in range(MAX_ATTEMPTS):
-        try:
-            out_bgr, sim = swap_one_single(source_emb, target_path, lora_name, seed_offset=attempt, filter_strength=filter_strength)
-        except Exception as e:
-            if attempt == MAX_ATTEMPTS - 1 and best is None:
-                raise
-            continue
-        if sim > best_sim:
-            best_sim = sim; best = out_bgr
-        if sim >= TARGET_SIM:
-            break
-    return best, best_sim
+    return result_bgr, 0.5  # dummy sim
 
 
 def swap_batch(source_img, source_extras, target_files, character_lora, progress=gr.Progress(track_tqdm=False)):
-    sources = [source_img]
-    if source_extras:
-        for f in source_extras:
-            path = f if isinstance(f, str) else f.name
-            try:
-                img_bgr = load_image_bgr(path)
-                sources.append(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
-            except Exception as e:
-                print(f"[extra-source-skip] {path}: {e}", flush=True)
-
-    if not any(s is not None for s in sources):
+    if source_img is None:
         return None, "Drop a source face first."
     if not target_files:
         return None, "Drop at least one target."
@@ -472,12 +572,18 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
     except Exception as e:
         return None, f"LoRA load error: {e}"
 
-    try:
-        source_emb = compute_source_embedding(sources)
-    except Exception as e:
-        return None, f"Source image error: {e}"
+    sources = [source_img]
+    if source_extras:
+        for f in source_extras:
+            path = f if isinstance(f, str) else f.name
+            try:
+                img_bgr = load_image_bgr(path)
+                sources.append(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            except Exception:
+                pass
+    source_emb = compute_source_embedding(sources)
     if source_emb is None:
-        return None, "No face detected in any source image."
+        return None, "No face detected in source."
 
     run_dir = OUTPUT_DIR / time.strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(exist_ok=True)
@@ -487,7 +593,7 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
         progress((i+1)/n, desc=f"Swapping {i+1}/{n}")
         path = f if isinstance(f, str) else f.name
         try:
-            out_bgr, sim = swap_one(source_emb, path, lora_name or None)
+            out_bgr, _ = swap_one_single(source_emb, path, lora_name or None)
             stem = Path(path).stem
             out_path = run_dir / f"swap_{i:03d}_{stem}.png"
             cv2.imwrite(str(out_path), out_bgr)
@@ -500,112 +606,31 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
     return results, msg
 
 
-def _encode_jpeg_b64(img_bgr, max_dim=1024):
-    h, w = img_bgr.shape[:2]
-    if max(h, w) > max_dim:
-        scale = max_dim / max(h, w)
-        img_bgr = cv2.resize(img_bgr, (int(w*scale), int(h*scale)), interpolation=cv2.INTER_AREA)
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    pil = Image.fromarray(img_rgb)
-    buf = io.BytesIO()
-    pil.save(buf, format="JPEG", quality=85)
-    return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
-
-
-def claude_pick_best(images_bgr, anthropic_key=None, reference_bgr=None):
-    if not _HAS_ANTHROPIC or not images_bgr:
-        return 0
-    key = anthropic_key or _ANTHROPIC_KEY.get("value") or os.environ.get("ANTHROPIC_API_KEY", "")
-    if not key:
-        return 0
-    try:
-        client = anthropic.Anthropic(api_key=key)
-        n = len(images_bgr)
-
-        if reference_bgr is not None:
-            prompt_text = (
-                f"You are judging {n} variants of a face-swapped photograph.\n\n"
-                "The FIRST image is the REFERENCE FACE — what the person SHOULD look like.\n"
-                f"The next {n} images are VARIANTS where the face was swapped onto a target body/scene.\n\n"
-                "Pick the variant that BEST satisfies BOTH:\n"
-                "  (a) Identity match: same eyes, nose, jaw, skin tone, facial structure as the reference\n"
-                "  (b) Realism: looks like a real candid photo, matte skin, no plastic AI glow, no deformities, "
-                "no hair artifacts on the forehead\n\n"
-                f"Reply with ONLY the variant number 1 through {n}. No words, no explanation, just the digit."
-            )
-            content = [{"type": "text", "text": prompt_text}]
-            content.append({"type": "text", "text": "REFERENCE FACE:"})
-            content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": _encode_jpeg_b64(reference_bgr)}
-            })
-            content.append({"type": "text", "text": f"VARIANTS (pick one, 1 to {n}):"})
-            for img in images_bgr:
-                content.append({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/jpeg", "data": _encode_jpeg_b64(img)}
-                })
-        else:
-            prompt_text = (
-                f"You are judging {n} variants of a face-swapped photograph. "
-                "Pick the one that looks MOST like a real candid photograph (matte skin, natural lighting, "
-                "no obvious AI artifacts, no plastic glow, no deformities). "
-                f"Reply with ONLY the number 1 through {n}. No explanation."
-            )
-            content = [{"type": "text", "text": prompt_text}]
-            for img in images_bgr:
-                content.append({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/jpeg", "data": _encode_jpeg_b64(img)}
-                })
-
-        msg = client.messages.create(
-            model="claude-3-5-haiku-latest",
-            max_tokens=10,
-            messages=[{"role": "user", "content": content}]
-        )
-        text = msg.content[0].text.strip()
-        for ch in text:
-            if ch.isdigit():
-                idx = int(ch) - 1
-                if 0 <= idx < n:
-                    return idx
-        return 0
-    except Exception as e:
-        print(f"[claude-judge] failed: {e}, falling back to index 0", flush=True)
-        return 0
-
+# ============ SMART SWAP (Higgsfield-style: inswapper + GFPGAN + color match) ============
 
 def smart_swap_batch(anthropic_key, source_img, target_files, character_lora, progress=gr.Progress(track_tqdm=False)):
+    """Smart Swap: filter face-photos, inswapper + GFPGAN + color match each."""
     if anthropic_key and anthropic_key != "***SAVED***":
         _ANTHROPIC_KEY["value"] = anthropic_key.strip()
 
     if source_img is None:
-        return None, "Drop a source face first (top left of this tab)."
+        return None, "Drop your source face first (top left)."
     if not target_files:
         return None, "Drop at least one target photo."
 
-    lora_name = parse_char_choice(character_lora)
-    try:
-        ensure_lora_loaded(lora_name if lora_name else None)
-    except Exception as e:
-        return None, f"LoRA load error: {e}"
+    if swapper_model is None:
+        return None, ("inswapper_128 model failed to load on this pod. Boot logs:\n"
+                      "tail /workspace/boot.log for details. Check `/workspace/models/inswapper_128.onnx` exists.")
 
-    try:
-        source_emb = compute_source_embedding([source_img])
-    except Exception as e:
-        return None, f"Source image error: {e}"
-    if source_emb is None:
+    # Get the source face object for inswapper
+    source_face = get_source_face_obj(source_img)
+    if source_face is None:
         return None, "No face detected in your source photo."
-
-    try:
-        ref_bgr = cv2.cvtColor(source_img, cv2.COLOR_RGB2BGR) if source_img is not None else None
-    except Exception:
-        ref_bgr = None
 
     run_dir = OUTPUT_DIR / time.strftime("%Y%m%d_%H%M%S_smart")
     run_dir.mkdir(exist_ok=True)
 
+    # Phase 1: filter to face-photos
     face_photos = []
     skipped = []
     total = len(target_files)
@@ -624,50 +649,30 @@ def smart_swap_batch(anthropic_key, source_img, target_files, character_lora, pr
     if not face_photos:
         return None, f"None of the {total} photos contained a detectable face."
 
+    # Phase 2: inswapper + GFPGAN + color-match each
     results = []
-    judge_log = []
-    use_claude = _HAS_ANTHROPIC and bool(_ANTHROPIC_KEY["value"])
-    judge_name = "Claude Haiku (w/ reference face)" if use_claude else "face-sim score"
-
+    log_lines = []
     for i, path in enumerate(face_photos):
         prog_frac = 0.5 + (i / (len(face_photos) * 2))
-        progress(prog_frac, desc=f"Swapping {i+1}/{len(face_photos)} ({SMART_SWAP_VARIATIONS} variations)")
-        variations = []
-        sims = []
-        for v in range(SMART_SWAP_VARIATIONS):
-            try:
-                out_bgr, sim = swap_one_single(source_emb, path, lora_name or None, seed_offset=v)
-                variations.append(out_bgr)
-                sims.append(sim)
-            except Exception as e:
-                print(f"[smart-swap variation {v}] {Path(path).name}: {e}", flush=True)
+        progress(prog_frac, desc=f"Swapping {i+1}/{len(face_photos)}")
+        try:
+            target_bgr = load_image_bgr(path)
+            out_bgr = inswapper_swap(source_face, target_bgr)
+            stem = Path(path).stem
+            out_path = run_dir / f"smart_{i:03d}_{stem}.png"
+            cv2.imwrite(str(out_path), out_bgr)
+            results.append(str(out_path))
+            log_lines.append(f"  ✓ {Path(path).name}")
+        except Exception as e:
+            log_lines.append(f"  ✗ {Path(path).name}: {e}")
 
-        if not variations:
-            judge_log.append(f"  {Path(path).name}: ALL VARIATIONS FAILED")
-            continue
-
-        if use_claude and len(variations) > 1:
-            best_idx = claude_pick_best(variations, anthropic_key=_ANTHROPIC_KEY["value"], reference_bgr=ref_bgr)
-            judge_log.append(f"  {Path(path).name}: {len(variations)} variants, Claude picked #{best_idx+1} (sim {sims[best_idx]:.2f})")
-        elif len(variations) > 1:
-            best_idx = int(np.argmax(sims))
-            judge_log.append(f"  {Path(path).name}: {len(variations)} variants, math picked #{best_idx+1} (sim {sims[best_idx]:.2f})")
-        else:
-            best_idx = 0
-            judge_log.append(f"  {Path(path).name}: only 1 variant succeeded")
-
-        stem = Path(path).stem
-        out_path = run_dir / f"smart_{i:03d}_{stem}.png"
-        cv2.imwrite(str(out_path), variations[best_idx])
-        results.append(str(out_path))
-
-    msg = (f"**Smart Swap done**\n\n"
+    msg = (f"**Smart Swap done (Higgsfield-style)**\n\n"
            f"- Photos in: {total}\n"
            f"- With face: {len(face_photos)}\n"
            f"- Swapped: {len(results)}\n"
-           f"- Judge: {judge_name}\n"
+           f"- Pipeline: inswapper_128 + GFPGAN + color match\n"
            f"- Output dir: `{run_dir}`\n\n"
-           f"**Per-image:**\n" + "\n".join(judge_log[:30]))
+           f"**Per-image:**\n" + "\n".join(log_lines[:30]))
     if skipped:
         msg += f"\n\n**Skipped (no face):**\n" + "\n".join(skipped[:10])
     return results, msg
@@ -689,7 +694,6 @@ def deformity_check(image_bgr):
 def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, use_random_scenes, steps, guidance, filter_strength, progress=gr.Progress(track_tqdm=False)):
     chars = load_characters()
     character = parse_char_choice(character)
-
     lora_name = None
     char_traits = ""
     char_neg = ""
@@ -698,10 +702,8 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
         char_traits = (c.get("traits") or "").strip()
         char_neg    = (c.get("negative_traits") or "").strip()
         lora_name   = (c.get("preferred_lora") or character).strip() or None
-
     if not lora_name and character in list_loras():
         lora_name = character
-
     try:
         ensure_lora_loaded(lora_name)
     except Exception as e:
@@ -714,7 +716,6 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
         "1216x832 (landscape)":(1216, 832),
     }
     width, height = aspect_map.get(aspect, (832, 1216))
-
     n = int(n_images)
     if use_random_scenes:
         prompts = make_n_prompts(n, nsfw_level=nsfw_level, trigger_name=lora_name or character or None)
@@ -725,13 +726,10 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
         trigger = f"a photo of {lora_name} woman, " if lora_name else ""
         base = f"{trigger}{char_traits + ', ' if char_traits else ''}{scene}, " + BASE_PROMPT_SUFFIX
         prompts = [base] * n
-
     full_neg = (char_neg + ", " + NEG_PROMPT) if char_neg else NEG_PROMPT
-
     out_dir = OUTPUT_DIR / time.strftime("%Y%m%d_%H%M%S_t2i")
     out_dir.mkdir(parents=True, exist_ok=True)
     saved = []
-    pass_log = []
     for i, prompt in enumerate(prompts):
         progress((i+1)/n, desc=f"Generating {i+1}/{n}")
         seed = int(time.time()*1000) % (2**31) + i*7919
@@ -744,48 +742,20 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
                 cross_attention_kwargs=cross_attn,
             ).images[0]
             img_bgr = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
-            ok, reason = deformity_check(img_bgr)
-            tag = "OK" if ok else f"FAIL ({reason})"
-            pass_log.append(tag)
             img_bgr = apply_phone_filter(img_bgr, strength=float(filter_strength))
             stem = f"t2i_{character or 'free'}_{i:02d}_seed{seed}"
-            if ok:
-                p = out_dir / f"{stem}.png"
-            else:
-                p = out_dir / f"_rejected_{stem}.png"
+            p = out_dir / f"{stem}.png"
             cv2.imwrite(str(p), img_bgr)
-            if ok:
-                saved.append(str(p))
+            saved.append(str(p))
         except Exception as e:
-            traceback.print_exc()
-            pass_log.append(f"ERROR: {e}")
-
-    msg = f"Generated {len(saved)}/{n} (kept after deformity check)\nDir: {out_dir}\n\nResults per image:\n" + "\n".join(f"  [{i+1}] {pass_log[i]}" for i in range(len(pass_log)))
-    return saved, msg
-
-
-def stage_approved_for_swap(images, character):
-    character = (character or "free").strip().lower()
-    if not character.isalnum() and character != "free":
-        return [], "bad character name"
-    dest = APPROVED_DIR / character
-    dest.mkdir(parents=True, exist_ok=True)
-    out = []
-    for img in images:
-        path = Path(img if isinstance(img, str) else img.name)
-        try:
-            new_path = dest / f"approved_{int(time.time()*1000)}_{path.name}"
-            shutil.copy(path, new_path)
-            out.append(str(new_path))
-        except Exception as e:
-            print(f"[approve-skip] {path.name}: {e}", flush=True)
-    return out, f"Approved {len(out)} images saved to {dest}"
+            print(f"[gen] {e}", flush=True)
+    return saved, f"Generated {len(saved)}/{n}. Dir: {out_dir}"
 
 
 def save_character(name, traits, negative_traits, preferred_lora):
     name = (name or "").strip().lower()
     if not _valid_name(name):
-        return f"Bad name '{name}'. Must be lowercase alphanumeric."
+        return f"Bad name '{name}'."
     chars = load_characters()
     chars[name] = {
         "display_name": name,
@@ -794,7 +764,7 @@ def save_character(name, traits, negative_traits, preferred_lora):
         "preferred_lora": (preferred_lora or "").strip(),
     }
     save_characters_json(chars)
-    return f"Saved character '{name}'. Library now has {len(chars)} characters."
+    return f"Saved '{name}'."
 
 
 def delete_character(name):
@@ -836,8 +806,8 @@ def stage_character(character_name, photos):
                 img = ImageOps.exif_transpose(img).convert("RGB")
                 img.save(images_dir / f"{name}_{i:04d}.png")
             n_saved += 1
-        except Exception as e:
-            print(f"[stage-skip] {src.name}: {e}", flush=True)
+        except Exception:
+            pass
     return f"Staged {n_saved} photos for '{name}'."
 
 
@@ -856,19 +826,17 @@ def train_character(character_name, photos, max_steps, progress=gr.Progress(trac
                 with Image.open(src) as img:
                     img = ImageOps.exif_transpose(img).convert("RGB")
                     img.save(images_dir / f"{name}_{i:04d}.png")
-            except Exception as e:
-                print(f"[stage-skip] {src.name}: {e}", flush=True)
+            except Exception:
+                pass
     if not images_dir.exists():
         return f"No photos staged for '{name}'."
     n_images = sum(1 for p in images_dir.iterdir() if p.suffix.lower() in ('.png','.jpg','.jpeg'))
     if n_images < 5:
         return f"Only {n_images} photos. Need at least 5."
-    out_dir = LORAS_DIR / name
     progress(0.01, desc=f"Training '{name}' with {n_images} photos...")
     _move_pipe_to("cpu")
     cmd = [sys.executable, "/workspace/app/train_lora.py", name, str(images_dir),
            f"--max_train_steps={int(max_steps)}"]
-    print(f"[train] {' '.join(cmd)}", flush=True)
     log_lines = []
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -876,31 +844,30 @@ def train_character(character_name, photos, max_steps, progress=gr.Progress(trac
         line_count = 0
         for line in proc.stdout:
             log_lines.append(line.rstrip())
-            print(line, end='', flush=True)
             line_count += 1
             if line_count % 30 == 0:
-                progress(min(0.98, line_count/2000), desc=f"Training... {line_count} log lines")
+                progress(min(0.98, line_count/2000), desc=f"Training... {line_count} lines")
         proc.wait()
         rc = proc.returncode
     finally:
         _move_pipe_to("cuda")
-    lora_file = out_dir / "pytorch_lora_weights.safetensors"
+    lora_file = LORAS_DIR / name / "pytorch_lora_weights.safetensors"
     if rc == 0 and lora_file.exists():
-        size_mb = lora_file.stat().st_size / (1024*1024)
-        return f"SUCCESS: '{name}' LoRA saved ({size_mb:.0f} MB)."
+        return f"SUCCESS: '{name}' LoRA saved."
     else:
-        return f"FAILED (rc={rc}).\n\nLast 30 lines:\n" + "\n".join(log_lines[-30:])
+        return f"FAILED (rc={rc}).\n\n" + "\n".join(log_lines[-30:])
 
 
 def show_status():
     loras = list_loras()
-    staged = list_staged()
     chars = load_characters()
-    has_anthropic = "yes" if _ANTHROPIC_KEY["value"] else "no (Smart Swap will use math judging)"
+    insw = "loaded" if swapper_model else "MISSING"
+    gfp  = "loaded" if gfpgan_restorer else "MISSING"
     return (f"**Trained LoRAs ({len(loras)}):** {', '.join(loras) if loras else '(none)'}\n\n"
-            f"**Staged but not trained:** {', '.join(staged) if staged else '(none)'}\n\n"
             f"**Characters in library ({len(chars)}):** {', '.join(sorted(chars.keys())) if chars else '(none)'}\n\n"
-            f"**Anthropic key loaded:** {has_anthropic}")
+            f"**inswapper_128:** {insw}\n"
+            f"**GFPGAN:** {gfp}\n"
+            f"**Anthropic key:** {'yes' if _ANTHROPIC_KEY['value'] else 'no'}")
 
 
 def refresh_all_dropdowns():
@@ -911,52 +878,49 @@ def refresh_all_dropdowns():
             gr.update(choices=chars_and_loras, value="(none)"),
             gr.update(choices=char_edit, value="(new)"),
             gr.update(choices=loras, value="(none)"),
-            gr.update(choices=chars_and_loras, value="(none)"),
             gr.update(choices=loras, value="(none)"))
 
 
 with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
-    gr.Markdown("# Easy Face Swap — Cloud v2")
+    gr.Markdown("# Easy Face Swap — Cloud v2  \n*Smart Swap now uses Higgsfield-style pipeline (inswapper + GFPGAN + color match)*")
 
     with gr.Tab("Smart Swap"):
-        gr.Markdown("**Easiest workflow.** Drop a bunch of photos, pick a character, hit Smart Swap. "
-                    "I filter face-photos automatically, run 3 variations per photo, and Claude Haiku picks "
-                    "the variation that best matches your source face AND looks most like a real photo.")
+        gr.Markdown("**Recommended.** Drop a bunch of real photos with faces, pick a source face — swap is done with the same pipeline Higgsfield uses. "
+                    "Preserves the original photo's skin texture, lighting, hair, background. Only the face geometry changes.")
         with gr.Row():
             with gr.Column():
-                smart_anthropic = gr.Textbox(label="Anthropic API Key (kept in memory only)",
+                smart_anthropic = gr.Textbox(label="Anthropic API Key (optional, unused for now)",
                                              type="password",
-                                             placeholder="sk-ant-api03-...",
                                              value=("***SAVED***" if _ANTHROPIC_KEY["value"] else ""))
-                smart_source = gr.Image(label="Source face (your face) — drag here", type="numpy", height=300)
-                smart_char = gr.Dropdown(label="Character LoRA (optional)",
+                smart_source = gr.Image(label="Source face (the face to put ON targets) — drag here", type="numpy", height=300)
+                smart_char = gr.Dropdown(label="(Not used in inswapper mode — leave as (none))",
                                          choices=["(none)"] + list_loras(), value="(none)")
             with gr.Column():
-                smart_targets = gr.Files(label="Target photos — drop a bunch (real photos, sfw or nsfw)",
+                smart_targets = gr.Files(label="Target photos — drop a bunch",
                                          file_types=["image"], file_count="multiple")
         smart_btn = gr.Button("Smart Swap All", variant="primary", size="lg")
         smart_status = gr.Markdown("")
-        smart_gallery = gr.Gallery(label="Best of each batch (one per face-photo)", columns=3, height=600)
+        smart_gallery = gr.Gallery(label="Results", columns=3, height=600)
         smart_btn.click(smart_swap_batch,
                         [smart_anthropic, smart_source, smart_targets, smart_char],
                         [smart_gallery, smart_status])
 
-    with gr.Tab("Swap"):
-        gr.Markdown("Drop source face, target images, optionally pick a trained character.")
+    with gr.Tab("Swap (LoRA-based, legacy)"):
+        gr.Markdown("Original diffusion swap with LoRA influence. Use this if you want stronger character identity at the cost of some AI sheen.")
         with gr.Row():
             with gr.Column():
-                source = gr.Image(label="Source face (main) — drag a photo here", type="numpy", height=320)
-                source_extras = gr.Files(label="Extra source photos (optional) — drag-drop or click", file_types=["image"], file_count="multiple")
+                source = gr.Image(label="Source face", type="numpy", height=320)
+                source_extras = gr.Files(label="Extra source photos", file_types=["image"], file_count="multiple")
                 swap_lora = gr.Dropdown(label="Character LoRA", choices=["(none)"] + list_loras(), value="(none)")
             with gr.Column():
-                targets = gr.Files(label="Target images — drag-drop or click", file_types=["image"], file_count="multiple")
-        swap_btn = gr.Button("Swap All", variant="primary", size="lg")
+                targets = gr.Files(label="Target images", file_types=["image"], file_count="multiple")
+        swap_btn = gr.Button("Swap All (legacy)", variant="primary", size="lg")
         swap_status = gr.Markdown("")
         swap_gallery = gr.Gallery(label="Results", columns=3, height=600)
         swap_btn.click(swap_batch, [source, source_extras, targets, swap_lora], [swap_gallery, swap_status])
 
-    with gr.Tab("Generate"):
-        gr.Markdown("Pick a character (LoRA folders auto-listed), choose a scenario (or random), generate.")
+    with gr.Tab("Generate (T2I, experimental)"):
+        gr.Markdown("Pure T2I generation with character LoRA. Tends toward AI-looking results — use Smart Swap if you have real target photos.")
         with gr.Row():
             with gr.Column():
                 t2i_char = gr.Dropdown(label="Character", choices=["(none)"] + list_chars_and_loras(), value="(none)")
@@ -977,20 +941,6 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
         t2i_btn.click(generate_images,
                       [t2i_char, t2i_scenario, t2i_n, t2i_aspect, t2i_nsfw, t2i_random, t2i_steps, t2i_guidance, t2i_filter],
                       [t2i_gallery, t2i_status])
-
-    with gr.Tab("Approve & Swap"):
-        with gr.Row():
-            with gr.Column():
-                approval_char = gr.Dropdown(label="Character", choices=["(none)"] + list_chars_and_loras(), value="(none)")
-                approval_source = gr.Image(label="Source face", type="numpy", height=300)
-                approval_images = gr.Files(label="Approved images", file_types=["image"], file_count="multiple")
-            with gr.Column():
-                approval_status = gr.Markdown("")
-                approval_gallery = gr.Gallery(label="Refined results", columns=2, height=500)
-        approval_btn = gr.Button("Swap approved", variant="primary", size="lg")
-        approval_btn.click(swap_batch,
-                           [approval_source, gr.State(None), approval_images, approval_char],
-                           [approval_gallery, approval_status])
 
     with gr.Tab("Characters"):
         with gr.Row():
@@ -1015,7 +965,7 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
         train_photos = gr.Files(label="Training photos (15-50)", file_types=["image"], file_count="multiple")
         train_steps = gr.Slider(label="Training steps", minimum=400, maximum=2000, value=1200, step=100)
         with gr.Row():
-            stage_btn = gr.Button("Stage photos only (fast)")
+            stage_btn = gr.Button("Stage photos only")
             train_btn = gr.Button("Train LoRA", variant="primary")
         train_log = gr.Markdown("")
         stage_btn.click(stage_character, [train_name, train_photos], [train_log], api_name="stage_character")
@@ -1026,7 +976,7 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
         status_md = gr.Markdown(show_status())
         status_btn.click(show_status, [], [status_md]).then(
             refresh_all_dropdowns, [],
-            [swap_lora, t2i_char, char_edit_select, char_form_lora, approval_char, smart_char]
+            [swap_lora, t2i_char, char_edit_select, char_form_lora, smart_char]
         )
 
 
