@@ -59,8 +59,10 @@ pip install -q -U pip || echo "pip upgrade FAILED"
 pip install -q -U 'gradio>=5,<6' || { echo "GRADIO INSTALL FAILED"; exit 1; }
 pip install -q 'transformers==4.46.3' 'diffusers==0.31.0' 'peft==0.13.2' 'accelerate==1.1.1' 'huggingface_hub==0.25.2' || { echo "core libs FAILED"; exit 1; }
 pip install -q insightface onnxruntime-gpu 'opencv-python<5' einops 'numpy<2' pillow-heif || { echo "image libs FAILED"; exit 1; }
+# Higgsfield-style pipeline deps: GFPGAN for face restoration
+pip install -q gfpgan facexlib realesrgan basicsr || echo "GFPGAN install FAILED (will fallback to no restoration)"
 # Anthropic SDK for Smart Swap (Claude Haiku judging)
-pip install -q anthropic || echo "anthropic SDK install FAILED (Smart Swap will fall back to math judging)"
+pip install -q anthropic || echo "anthropic SDK install FAILED"
 # Training-only deps
 pip install -q bitsandbytes datasets prodigyopt tensorboard || echo "training libs FAILED (non-critical)"
 
@@ -92,7 +94,33 @@ else
   echo "antelopev2 already cached."
 fi
 
-echo "--- clone InstantID pipeline ---"
+echo "--- inswapper_128 model (face swap) ---"
+INSWAPPER_PATH=/workspace/models/inswapper_128.onnx
+mkdir -p /workspace/models
+if [ ! -f "$INSWAPPER_PATH" ]; then
+  echo "Downloading inswapper_128.onnx (~530MB)..."
+  wget -q -O "$INSWAPPER_PATH" "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx" || \
+  wget -q -O "$INSWAPPER_PATH" "https://huggingface.co/datasets/Gourieff/ReActor/resolve/main/models/inswapper_128.onnx" || echo "inswapper download FAILED"
+  ls -la "$INSWAPPER_PATH" 2>/dev/null || echo "no inswapper file"
+else
+  echo "inswapper_128 already cached."
+fi
+
+echo "--- GFPGAN v1.4 model (face restoration) ---"
+GFPGAN_PATH=/workspace/models/GFPGANv1.4.pth
+if [ ! -f "$GFPGAN_PATH" ]; then
+  echo "Downloading GFPGANv1.4.pth (~350MB)..."
+  wget -q -O "$GFPGAN_PATH" "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth" || echo "GFPGAN download FAILED"
+  ls -la "$GFPGAN_PATH" 2>/dev/null || echo "no GFPGAN file"
+else
+  echo "GFPGAN v1.4 already cached."
+fi
+
+# Pre-stage GFPGAN's expected paths (it looks in cwd/gfpgan/weights by default)
+mkdir -p /workspace/gfpgan/weights
+ln -sfn "$GFPGAN_PATH" /workspace/gfpgan/weights/GFPGANv1.4.pth 2>/dev/null || true
+
+echo "--- clone InstantID pipeline (still used by 'Swap' tab) ---"
 if [ ! -d /workspace/InstantID ]; then
   git clone --depth 1 https://github.com/instantX-research/InstantID.git /workspace/InstantID || { echo "InstantID clone FAILED"; exit 1; }
 fi
