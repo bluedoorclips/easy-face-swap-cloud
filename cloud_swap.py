@@ -12,18 +12,39 @@ Tabs:
 import os, sys, time, traceback, subprocess, shutil, json, gc, random
 from pathlib import Path
 
-sys.path.insert(0, "/workspace/InstantID")
-sys.path.insert(0, "/workspace/app")  # so we can import prompts_library
+# Crash logging - if startup fails, write traceback to file so we can debug
+CRASH_LOG = "/workspace/v2_startup_error.log"
+try:
+    Path("/workspace").mkdir(exist_ok=True)
+except Exception:
+    pass
 
-import cv2
-import numpy as np
-import torch
-from PIL import Image, ImageOps
-import gradio as gr
-from insightface.app import FaceAnalysis
-from huggingface_hub import snapshot_download
-from diffusers import StableDiffusionXLPipeline
-from diffusers.models import ControlNetModel
+def _log_crash_and_reraise(stage):
+    tb = traceback.format_exc()
+    msg = f"\n{'='*60}\nCRASH at stage: {stage}\n{'='*60}\n{tb}\n"
+    print(msg, flush=True)
+    try:
+        with open(CRASH_LOG, "a") as f:
+            f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+    except Exception:
+        pass
+    raise
+
+try:
+    sys.path.insert(0, "/workspace/InstantID")
+    sys.path.insert(0, "/workspace/app")  # so we can import prompts_library
+
+    import cv2
+    import numpy as np
+    import torch
+    from PIL import Image, ImageOps
+    import gradio as gr
+    from insightface.app import FaceAnalysis
+    from huggingface_hub import snapshot_download
+    from diffusers import StableDiffusionXLPipeline, AutoPipelineForText2Image
+    from diffusers.models import ControlNetModel
+except Exception:
+    _log_crash_and_reraise("imports")
 
 try:
     import pillow_heif
@@ -31,8 +52,11 @@ try:
 except Exception:
     pass
 
-from pipeline_stable_diffusion_xl_instantid_img2img import StableDiffusionXLInstantIDImg2ImgPipeline
-from pipeline_stable_diffusion_xl_instantid import draw_kps
+try:
+    from pipeline_stable_diffusion_xl_instantid_img2img import StableDiffusionXLInstantIDImg2ImgPipeline
+    from pipeline_stable_diffusion_xl_instantid import draw_kps
+except Exception:
+    _log_crash_and_reraise("InstantID pipeline import")
 
 try:
     from prompts_library import make_n_prompts
@@ -85,43 +109,58 @@ print("=" * 60)
 print("Easy Face Swap v2 (cloud) — loading...")
 print("=" * 60)
 
-print("[1/3] Face analyzer (antelopev2)...")
-face_app = FaceAnalysis(name="antelopev2", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-face_app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.3)
+try:
+    print("[1/3] Face analyzer (antelopev2)...", flush=True)
+    face_app = FaceAnalysis(name="antelopev2", providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    face_app.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.3)
+except Exception:
+    _log_crash_and_reraise("FaceAnalysis init")
 
-print(f"[2/3] InstantID img2img on {BASE_MODEL}...")
-instantid_dir = snapshot_download("InstantX/InstantID", allow_patterns=["ControlNetModel/*", "ip-adapter.bin"])
-controlnet = ControlNetModel.from_pretrained(os.path.join(instantid_dir, "ControlNetModel"), torch_dtype=DTYPE)
-pipe = StableDiffusionXLInstantIDImg2ImgPipeline.from_pretrained(
-    BASE_MODEL, controlnet=controlnet, torch_dtype=DTYPE,
-    variant="fp16", use_safetensors=True,
-)
-pipe.load_ip_adapter_instantid(os.path.join(instantid_dir, "ip-adapter.bin"))
+try:
+    print(f"[2/3] InstantID img2img on {BASE_MODEL}...", flush=True)
+    instantid_dir = snapshot_download("InstantX/InstantID", allow_patterns=["ControlNetModel/*", "ip-adapter.bin"])
+    controlnet = ControlNetModel.from_pretrained(os.path.join(instantid_dir, "ControlNetModel"), torch_dtype=DTYPE)
+    pipe = StableDiffusionXLInstantIDImg2ImgPipeline.from_pretrained(
+        BASE_MODEL, controlnet=controlnet, torch_dtype=DTYPE,
+        variant="fp16", use_safetensors=True,
+    )
+    pipe.load_ip_adapter_instantid(os.path.join(instantid_dir, "ip-adapter.bin"))
 
-vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-print(f"GPU VRAM: {vram_gb:.0f} GB")
-if vram_gb >= 20:
-    pipe.to("cuda")
-    _PIPE_ON_GPU = True
-else:
-    pipe.enable_model_cpu_offload(); pipe.enable_vae_tiling(); pipe.enable_vae_slicing()
-    _PIPE_ON_GPU = False
-pipe.set_progress_bar_config(disable=True)
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    print(f"GPU VRAM: {vram_gb:.0f} GB", flush=True)
+    if vram_gb >= 20:
+        pipe.to("cuda")
+        _PIPE_ON_GPU = True
+    else:
+        pipe.enable_model_cpu_offload(); pipe.enable_vae_tiling(); pipe.enable_vae_slicing()
+        _PIPE_ON_GPU = False
+    pipe.set_progress_bar_config(disable=True)
+except Exception:
+    _log_crash_and_reraise("InstantID pipeline load")
 
-print("[3/3] T2I pipeline (shares components with swap pipe)...")
-t2i_pipe = StableDiffusionXLPipeline(
-    vae=pipe.vae,
-    text_encoder=pipe.text_encoder,
-    text_encoder_2=pipe.text_encoder_2,
-    tokenizer=pipe.tokenizer,
-    tokenizer_2=pipe.tokenizer_2,
-    unet=pipe.unet,
-    scheduler=pipe.scheduler,
-)
-t2i_pipe.set_progress_bar_config(disable=True)
+try:
+    print("[3/3] T2I pipeline...", flush=True)
+    # Try AutoPipeline.from_pipe first (shares components, no extra VRAM)
+    t2i_pipe = None
+    try:
+        t2i_pipe = AutoPipelineForText2Image.from_pipe(pipe)
+        print("  -> via from_pipe (shared components)", flush=True)
+    except Exception as e:
+        print(f"  -> from_pipe failed ({e}); loading fresh", flush=True)
+    if t2i_pipe is None:
+        # Fallback: load fresh - costs ~6GB extra VRAM but reliable
+        t2i_pipe = StableDiffusionXLPipeline.from_pretrained(
+            BASE_MODEL, torch_dtype=DTYPE, variant="fp16", use_safetensors=True,
+        )
+        if vram_gb >= 20:
+            t2i_pipe.to("cuda")
+        print("  -> loaded fresh from_pretrained", flush=True)
+    t2i_pipe.set_progress_bar_config(disable=True)
+except Exception:
+    _log_crash_and_reraise("T2I pipeline init")
 
 _current_lora = {"name": None}
-print("Ready.")
+print("Ready.", flush=True)
 
 
 # ============ HELPERS ============
@@ -420,9 +459,7 @@ def deformity_check(image_bgr):
 
 
 def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, use_random_scenes, steps, guidance, progress=gr.Progress(track_tqdm=False)):
-    """T2I generation with optional character LoRA + traits.
-    If use_random_scenes is True, build scenes from the prompt library.
-    Otherwise use custom_scenario."""
+    """T2I generation with optional character LoRA + traits."""
     chars = load_characters()
     character = (character or "").strip()
     if character == "(none)":
@@ -454,7 +491,6 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
     }
     width, height = aspect_map.get(aspect, (832, 1216))
 
-    # Build N prompts
     n = int(n_images)
     if use_random_scenes:
         prompts = make_n_prompts(n, nsfw_level=nsfw_level, trigger_name=lora_name or character or None)
@@ -496,6 +532,7 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
             if ok:
                 saved.append(str(p))
         except Exception as e:
+            traceback.print_exc()
             pass_log.append(f"ERROR: {e}")
 
     msg = f"Generated {len(saved)}/{n} (kept after deformity check)\nDir: {out_dir}\n\nResults per image:\n" + "\n".join(f"  [{i+1}] {pass_log[i]}" for i in range(len(pass_log)))
@@ -505,8 +542,6 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
 # ============ APPROVED → SWAP PIPELINE ============
 
 def stage_approved_for_swap(images, character):
-    """Take selected/approved images and copy them to APPROVED_DIR/{character}/
-    so they can be face-swapped against. Returns paths."""
     character = (character or "free").strip().lower()
     if not character.isalnum() and character != "free":
         return [], "bad character name"
@@ -651,7 +686,6 @@ def refresh_all_dropdowns():
     loras = ["(none)"] + list_loras()
     chars = ["(none)"] + list_characters()
     char_edit = ["(new)"] + list_characters()
-    # 5 dropdowns: swap_lora, t2i_char, char_edit_select, char_form_lora, approval_char
     return (gr.update(choices=loras, value="(none)"),
             gr.update(choices=chars, value="(none)"),
             gr.update(choices=char_edit, value="(new)"),
@@ -713,7 +747,6 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
                 approval_status = gr.Markdown("")
                 approval_gallery = gr.Gallery(label="Refined results", columns=2, height=500)
         approval_btn = gr.Button("Swap approved images", variant="primary", size="lg")
-        # Reuse swap_batch (sources: just the supplied source_img, no extras, targets: approved images)
         approval_btn.click(swap_batch,
                            [approval_source, gr.State(None), approval_images, approval_char],
                            [approval_gallery, approval_status])
