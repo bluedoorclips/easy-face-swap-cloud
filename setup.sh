@@ -87,4 +87,41 @@ export HF_HOME=/workspace/hf_cache
 
 echo "--- launching app ---"
 cd "$(dirname "$0")"
-exec python cloud_swap.py
+
+# Run cloud_swap.py - if it exits/crashes, fall through to fallback HTTP server
+# so we can read logs through the browser (no SSH needed)
+python cloud_swap.py 2>&1 | tee -a /workspace/runtime.log
+
+# === FALLBACK: cloud_swap.py exited/crashed ===
+echo "=== cloud_swap.py exited at $(date -u) ===" | tee -a /workspace/runtime.log
+echo "Starting fallback file server on port 7860 so logs are browsable..." | tee -a /workspace/runtime.log
+
+# Build a tiny index page so user can see what crashed
+cat > /workspace/index.html <<'HTML'
+<!DOCTYPE html>
+<html><head><title>Easy Face Swap - DIAGNOSTIC MODE</title>
+<style>
+body { font-family: monospace; padding: 20px; background: #111; color: #eee; }
+h1 { color: #f55; }
+a { color: #5af; }
+pre { background: #222; padding: 12px; border-radius: 4px; max-height: 60vh; overflow: auto; }
+</style></head>
+<body>
+<h1>Easy Face Swap - DIAGNOSTIC MODE</h1>
+<p>The main app crashed during boot. View the logs below to see what went wrong.</p>
+<p><a href="/runtime.log">runtime.log</a> (full python output + crash) -
+ <a href="/boot.log">boot.log</a> (setup script output) -
+ <a href="/v2_startup_error.log">v2_startup_error.log</a> (if v2 init failed)</p>
+<h2>runtime.log (last 200 lines)</h2>
+<pre id="rt">loading...</pre>
+<script>
+fetch('/runtime.log').then(r=>r.text()).then(t=>{
+  const lines = t.split('\n');
+  document.getElementById('rt').textContent = lines.slice(-200).join('\n');
+});
+</script>
+</body></html>
+HTML
+
+cd /workspace
+exec python -m http.server 7860
