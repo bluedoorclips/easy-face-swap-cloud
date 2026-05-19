@@ -37,7 +37,6 @@ try:
 except Exception:
     _log_crash_and_reraise("imports")
 
-# Optional: anthropic SDK for Claude Haiku batch judging
 try:
     import anthropic
     _HAS_ANTHROPIC = True
@@ -80,15 +79,17 @@ STRENGTH = 0.60
 STEPS    = 32
 GUIDANCE = 2.5
 
-LORA_SCALE_SWAP     = 0.85
+# Bumped for stronger identity in swap (was 0.85 / 0.5)
+LORA_SCALE_SWAP     = 1.0
 LORA_SCALE_GENERATE = 1.05
-IP_SCALE_WITH_LORA  = 0.5
+IP_SCALE_WITH_LORA  = 0.65
 CN_SCALE_WITH_LORA  = 0.65
 
 T2I_STEPS    = 30
 T2I_GUIDANCE = 2.0
 
-PHONE_FILTER_DEFAULT = 0.6
+# Bumped from 0.6 — more aggressive anti-shine
+PHONE_FILTER_DEFAULT = 0.75
 
 TARGET_SIM   = 0.55
 MAX_ATTEMPTS = 3
@@ -96,7 +97,7 @@ GEN_SIZE     = 1024
 MAX_INPUT_DIM = 2048
 CROP_PAD     = 1.35
 
-SMART_SWAP_VARIATIONS = 3  # Number of swap variations per target photo
+SMART_SWAP_VARIATIONS = 3
 
 BASE_PROMPT_SUFFIX = "candid amateur iPhone photograph, matte skin without makeup highlights, real skin texture with pores and minor blemishes, natural skin tone, no retouching, no filter, slight ISO grain, soft uneven lighting"
 
@@ -114,7 +115,6 @@ NEG_PROMPT = (
     "extra limbs, ugly, blurry, lowres, fake, oversaturated, posterized"
 )
 
-# Runtime storage for the user-provided Anthropic API key (set via Smart Swap tab textbox)
 _ANTHROPIC_KEY = {"value": os.environ.get("ANTHROPIC_API_KEY", "")}
 
 print("=" * 60)
@@ -359,7 +359,6 @@ def compute_source_embedding(source_images):
 
 
 def swap_one_single(source_emb, target_path, lora_name=None, seed_offset=0, filter_strength=PHONE_FILTER_DEFAULT):
-    """Single swap attempt — no retry loop, used by smart_swap to produce N variations."""
     if not _PIPE_ON_GPU:
         _move_pipe_to("cuda")
     target_bgr = load_image_bgr(target_path)
@@ -410,7 +409,6 @@ def swap_one_single(source_emb, target_path, lora_name=None, seed_offset=0, filt
     ).images[0]
     gen_full = cv2.cvtColor(np.array(result), cv2.COLOR_RGB2BGR)
 
-    # Compute face similarity for the math-based judge fallback
     gf = face_app.get(gen_full)
     if gf:
         biggest = max(gf, key=lambda f: (f.bbox[2]-f.bbox[0])*(f.bbox[3]-f.bbox[1]))
@@ -419,7 +417,6 @@ def swap_one_single(source_emb, target_path, lora_name=None, seed_offset=0, filt
     else:
         sim = -1.0
 
-    # Composite the gen back onto the original target image
     gen_bgr = cv2.resize(gen_full, (cw, ch), interpolation=cv2.INTER_LANCZOS4)
     result_bgr = target_bgr.copy()
     crop_orig = result_bgr[sy1:sy2, sx1:sx2].copy()
@@ -438,7 +435,6 @@ def swap_one_single(source_emb, target_path, lora_name=None, seed_offset=0, filt
 
 
 def swap_one(source_emb, target_path, lora_name=None, filter_strength=PHONE_FILTER_DEFAULT):
-    """Original swap with internal MAX_ATTEMPTS retry loop, picks best by face sim."""
     best = None; best_sim = -1.0
     for attempt in range(MAX_ATTEMPTS):
         try:
@@ -507,7 +503,6 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
 # ============ SMART SWAP — Claude Haiku judges best of N variations ============
 
 def _encode_jpeg_b64(img_bgr, max_dim=1024):
-    """Encode BGR image to base64 JPEG for Claude API. Downscales if too big."""
     h, w = img_bgr.shape[:2]
     if max(h, w) > max_dim:
         scale = max_dim / max(h, w)
@@ -519,32 +514,54 @@ def _encode_jpeg_b64(img_bgr, max_dim=1024):
     return base64.standard_b64encode(buf.getvalue()).decode("utf-8")
 
 
-def claude_pick_best(images_bgr, anthropic_key=None):
-    """Ask Claude Haiku to pick the most realistic image from a list. Returns index 0..N-1.
-    Falls back to first image if API unavailable or fails."""
+def claude_pick_best(images_bgr, anthropic_key=None, reference_bgr=None):
+    """Ask Claude Haiku to pick the most aimee-like + realistic variation.
+    If reference_bgr provided, Claude compares variants to that reference face."""
     if not _HAS_ANTHROPIC or not images_bgr:
         return 0
     key = anthropic_key or _ANTHROPIC_KEY.get("value") or os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
-        return 0  # No key = no judging
+        return 0
     try:
         client = anthropic.Anthropic(api_key=key)
-        content = [{
-            "type": "text",
-            "text": (
-                f"You are judging {len(images_bgr)} variants of a face-swapped photograph. "
-                "Pick the one that looks MOST like a real photograph (matte skin, natural lighting, "
-                "no obvious AI artifacts like hair-on-forehead, deformed features, plastic skin, "
-                "or unnatural glow). "
-                f"Reply with ONLY the number 1 through {len(images_bgr)}. No explanation."
+        n = len(images_bgr)
+
+        if reference_bgr is not None:
+            prompt_text = (
+                f"You are judging {n} variants of a face-swapped photograph.\n\n"
+                "The FIRST image is the REFERENCE FACE — what the person SHOULD look like.\n"
+                f"The next {n} images are VARIANTS where the face was swapped onto a target body/scene.\n\n"
+                "Pick the variant that BEST satisfies BOTH:\n"
+                "  (a) Identity match: same eyes, nose, jaw, skin tone, facial structure as the reference\n"
+                "  (b) Realism: looks like a real candid photo, matte skin, no plastic AI glow, no deformities, "
+                "no hair artifacts on the forehead\n\n"
+                f"Reply with ONLY the variant number 1 through {n}. No words, no explanation, just the digit."
             )
-        }]
-        for img in images_bgr:
-            b64 = _encode_jpeg_b64(img)
+            content = [{"type": "text", "text": prompt_text}]
+            content.append({"type": "text", "text": "REFERENCE FACE:"})
             content.append({
                 "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": _encode_jpeg_b64(reference_bgr)}
             })
+            content.append({"type": "text", "text": f"VARIANTS (pick one, 1 to {n}):"})
+            for img in images_bgr:
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": _encode_jpeg_b64(img)}
+                })
+        else:
+            prompt_text = (
+                f"You are judging {n} variants of a face-swapped photograph. "
+                "Pick the one that looks MOST like a real candid photograph (matte skin, natural lighting, "
+                "no obvious AI artifacts, no plastic glow, no deformities). "
+                f"Reply with ONLY the number 1 through {n}. No explanation."
+            )
+            content = [{"type": "text", "text": prompt_text}]
+            for img in images_bgr:
+                content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": _encode_jpeg_b64(img)}
+                })
 
         msg = client.messages.create(
             model="claude-3-5-haiku-latest",
@@ -552,11 +569,10 @@ def claude_pick_best(images_bgr, anthropic_key=None):
             messages=[{"role": "user", "content": content}]
         )
         text = msg.content[0].text.strip()
-        # Parse first digit
         for ch in text:
             if ch.isdigit():
                 idx = int(ch) - 1
-                if 0 <= idx < len(images_bgr):
+                if 0 <= idx < n:
                     return idx
         return 0
     except Exception as e:
@@ -565,9 +581,7 @@ def claude_pick_best(images_bgr, anthropic_key=None):
 
 
 def smart_swap_batch(anthropic_key, source_img, target_files, character_lora, progress=gr.Progress(track_tqdm=False)):
-    """Smart Swap: filter face-photos, do N variations each, Claude picks best."""
-    # Save key for future calls
-    if anthropic_key:
+    if anthropic_key and anthropic_key != "***SAVED***":
         _ANTHROPIC_KEY["value"] = anthropic_key.strip()
 
     if source_img is None:
@@ -588,10 +602,15 @@ def smart_swap_batch(anthropic_key, source_img, target_files, character_lora, pr
     if source_emb is None:
         return None, "No face detected in your source photo."
 
+    # Convert source_img (RGB numpy) to BGR for Claude reference
+    try:
+        ref_bgr = cv2.cvtColor(source_img, cv2.COLOR_RGB2BGR) if source_img is not None else None
+    except Exception:
+        ref_bgr = None
+
     run_dir = OUTPUT_DIR / time.strftime("%Y%m%d_%H%M%S_smart")
     run_dir.mkdir(exist_ok=True)
 
-    # Phase 1: filter to photos with faces
     face_photos = []
     skipped = []
     total = len(target_files)
@@ -610,11 +629,10 @@ def smart_swap_batch(anthropic_key, source_img, target_files, character_lora, pr
     if not face_photos:
         return None, f"None of the {total} photos contained a detectable face."
 
-    # Phase 2: for each face-photo, swap N times + Claude picks best
     results = []
     judge_log = []
     use_claude = _HAS_ANTHROPIC and bool(_ANTHROPIC_KEY["value"])
-    judge_name = "Claude Haiku" if use_claude else "face-sim score"
+    judge_name = "Claude Haiku (w/ reference face)" if use_claude else "face-sim score"
 
     for i, path in enumerate(face_photos):
         prog_frac = 0.5 + (i / (len(face_photos) * 2))
@@ -633,10 +651,9 @@ def smart_swap_batch(anthropic_key, source_img, target_files, character_lora, pr
             judge_log.append(f"  {Path(path).name}: ALL VARIATIONS FAILED")
             continue
 
-        # Pick best variation
         if use_claude and len(variations) > 1:
-            best_idx = claude_pick_best(variations, anthropic_key=_ANTHROPIC_KEY["value"])
-            judge_log.append(f"  {Path(path).name}: {len(variations)} variants, Claude picked #{best_idx+1}")
+            best_idx = claude_pick_best(variations, anthropic_key=_ANTHROPIC_KEY["value"], reference_bgr=ref_bgr)
+            judge_log.append(f"  {Path(path).name}: {len(variations)} variants, Claude picked #{best_idx+1} (sim {sims[best_idx]:.2f})")
         elif len(variations) > 1:
             best_idx = int(np.argmax(sims))
             judge_log.append(f"  {Path(path).name}: {len(variations)} variants, math picked #{best_idx+1} (sim {sims[best_idx]:.2f})")
@@ -644,7 +661,6 @@ def smart_swap_batch(anthropic_key, source_img, target_files, character_lora, pr
             best_idx = 0
             judge_log.append(f"  {Path(path).name}: only 1 variant succeeded")
 
-        # Save the chosen one
         stem = Path(path).stem
         out_path = run_dir / f"smart_{i:03d}_{stem}.png"
         cv2.imwrite(str(out_path), variations[best_idx])
@@ -909,11 +925,11 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
 
     with gr.Tab("Smart Swap"):
         gr.Markdown("**Easiest workflow.** Drop a bunch of photos, pick a character, hit Smart Swap. "
-                    "I filter face-photos automatically, run 3 variations per photo, and pick the most realistic one. "
-                    "(Claude Haiku judges if you provide an API key, otherwise face-similarity math is used.)")
+                    "I filter face-photos automatically, run 3 variations per photo, and Claude Haiku picks "
+                    "the variation that best matches your source face AND looks most like a real photo.")
         with gr.Row():
             with gr.Column():
-                smart_anthropic = gr.Textbox(label="Anthropic API Key (optional — kept in memory only, paste once)",
+                smart_anthropic = gr.Textbox(label="Anthropic API Key (kept in memory only)",
                                              type="password",
                                              placeholder="sk-ant-api03-...",
                                              value=("***SAVED***" if _ANTHROPIC_KEY["value"] else ""))
