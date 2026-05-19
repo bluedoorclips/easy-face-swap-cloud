@@ -66,19 +66,16 @@ for d in (OUTPUT_DIR, LORAS_DIR, TRAINING_DIR, APPROVED_DIR):
 DTYPE = torch.float16
 BASE_MODEL = "SG161222/RealVisXL_V4.0"
 
-# Swap defaults (no LoRA)
 IP_SCALE = 0.85
 CN_SCALE = 0.80
 STRENGTH = 0.60
 STEPS    = 32
 GUIDANCE = 2.5
 
-# Swap with LoRA — dropped LoRA scale 1.0 -> 0.85 to reduce face/forehead artifacts + over-perfection
 LORA_SCALE         = 0.85
 IP_SCALE_WITH_LORA = 0.5
 CN_SCALE_WITH_LORA = 0.65
 
-# T2I generation defaults — dropped 2.8 -> 2.0 (user testing found this is the realism sweet spot)
 T2I_STEPS    = 30
 T2I_GUIDANCE = 2.0
 
@@ -88,22 +85,16 @@ GEN_SIZE     = 1024
 MAX_INPUT_DIM = 2048
 CROP_PAD     = 1.35
 
-# Strong matte / amateur push
 BASE_PROMPT_SUFFIX = "candid amateur iPhone photograph, matte skin without makeup highlights, real skin texture with pores and minor blemishes, natural skin tone, no retouching, no filter, slight ISO grain, soft uneven lighting"
 
-# Aggressive anti-shine + anti-perfection + anti-artifact negative prompt
 NEG_PROMPT = (
-    # AI tells
     "AI generated, CGI, 3d render, plastic skin, doll face, perfect symmetry, "
-    # Polish/shine — the big one
     "airbrushed skin, smooth perfect skin, glowing skin, glossy skin, shiny skin, "
     "oily skin, dewy skin, highlighter on cheekbones, contoured makeup, "
     "beauty filter, instagram filter, glamour shot, magazine cover, "
     "professional fashion photography, studio softbox lighting, ring light, "
     "retouched, photoshopped, flawless, model in skincare ad, "
-    # Style we don't want
     "cartoon, illustration, painting, anime, oil painting, "
-    # Hand/face deformities
     "deformed hands, extra fingers, missing fingers, fused fingers, deformed face, "
     "deformed head, low forehead, hair on forehead, stray hair strand, "
     "hair artifact, dark line on face, hair bleeding into skin, "
@@ -704,11 +695,11 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
         gr.Markdown("Drop source face, target images, optionally pick a trained character.")
         with gr.Row():
             with gr.Column():
-                source = gr.Image(label="Source face (main)", type="numpy", height=320)
-                source_extras = gr.Files(label="Extra source photos (optional)", file_types=["image"], file_count="multiple")
+                source = gr.Image(label="Source face (main) — drag a photo here", type="numpy", height=320)
+                source_extras = gr.Files(label="Extra source photos (optional) — drag-drop or click", file_types=["image"], file_count="multiple")
                 swap_lora = gr.Dropdown(label="Character LoRA", choices=["(none)"] + list_loras(), value="(none)")
             with gr.Column():
-                targets = gr.Files(label="Target images", file_types=["image"], file_count="multiple")
+                targets = gr.Files(label="Target images — drag-drop or click", file_types=["image"], file_count="multiple")
         swap_btn = gr.Button("Swap All", variant="primary", size="lg")
         swap_status = gr.Markdown("")
         swap_gallery = gr.Gallery(label="Results", columns=3, height=600)
@@ -738,12 +729,12 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
                       [t2i_gallery, t2i_status])
 
     with gr.Tab("Approve & Swap"):
-        gr.Markdown("Upload approved images, pick the same character, run face-swap pipeline.")
+        gr.Markdown("Drag approved images into the box, pick the same character, run face-swap pipeline.")
         with gr.Row():
             with gr.Column():
                 approval_char = gr.Dropdown(label="Character", choices=["(none)"] + list_chars_and_loras(), value="(none)")
                 approval_source = gr.Image(label="Source face (optional)", type="numpy", height=300)
-                approval_images = gr.Files(label="Approved images", file_types=["image"], file_count="multiple")
+                approval_images = gr.Files(label="Approved images — drag-drop or click", file_types=["image"], file_count="multiple")
             with gr.Column():
                 approval_status = gr.Markdown("")
                 approval_gallery = gr.Gallery(label="Refined results", columns=2, height=500)
@@ -772,7 +763,7 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
 
     with gr.Tab("Train"):
         train_name = gr.Textbox(label="Character name")
-        train_photos = gr.Files(label="Training photos (15-50)", file_types=["image"], file_count="multiple")
+        train_photos = gr.Files(label="Training photos (15-50) — drag-drop or click", file_types=["image"], file_count="multiple")
         train_steps = gr.Slider(label="Training steps", minimum=400, maximum=2000, value=1200, step=100)
         with gr.Row():
             stage_btn = gr.Button("Stage photos only (fast)")
@@ -791,9 +782,11 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
 
 
 if __name__ == "__main__":
-    demo.queue().launch(
+    demo.queue(max_size=20).launch(
         server_name="0.0.0.0",
         server_port=7860,
         show_error=True,
         allowed_paths=[str(OUTPUT_DIR), str(APPROVED_DIR)],
+        max_file_size="100mb",
+        ssr_mode=False,
     )
