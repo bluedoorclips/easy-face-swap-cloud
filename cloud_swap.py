@@ -32,7 +32,7 @@ def _log_crash_and_reraise(stage):
 
 try:
     sys.path.insert(0, "/workspace/InstantID")
-    sys.path.insert(0, "/workspace/app")  # so we can import prompts_library
+    sys.path.insert(0, "/workspace/app")
 
     import cv2
     import numpy as np
@@ -83,13 +83,15 @@ STEPS    = 32
 GUIDANCE = 2.5
 
 # Swap with LoRA — LoRA leads, InstantID follows
-LORA_SCALE         = 1.2
+# REALISM TUNING: dropped LORA_SCALE from 1.2 -> 1.0 to give the model more breathing room
+LORA_SCALE         = 1.0
 IP_SCALE_WITH_LORA = 0.5
 CN_SCALE_WITH_LORA = 0.65
 
 # T2I generation defaults
+# REALISM TUNING: dropped guidance from 4.0 -> 2.8 (less prompt-compliance = more naturalism)
 T2I_STEPS    = 30
-T2I_GUIDANCE = 4.0
+T2I_GUIDANCE = 2.8
 
 TARGET_SIM   = 0.55
 MAX_ATTEMPTS = 2
@@ -97,12 +99,17 @@ GEN_SIZE     = 1024
 MAX_INPUT_DIM = 2048
 CROP_PAD     = 1.35
 
-BASE_PROMPT_SUFFIX = "ultra high resolution, sharp focus, photorealistic, fine skin pores, natural lighting, raw photo, film grain"
+# Pushed toward amateur, unpolished look
+BASE_PROMPT_SUFFIX = "amateur iPhone photograph, candid snapshot, real skin texture with pores, no retouching, natural skin tone, slight ISO grain"
+
+# Strengthened anti-AI-glamour terms in negative prompt
 NEG_PROMPT = (
-    "AI generated, CGI, 3d render, plastic skin, airbrushed, doll face, perfect symmetry, "
-    "glossy, cartoon, illustration, painting, deformed hands, extra fingers, missing fingers, "
-    "fused fingers, deformed face, extra limbs, ugly, blurry, lowres, "
-    "beauty filter, instagram filter, fake, oversaturated, posterized"
+    "AI generated, CGI, 3d render, plastic skin, airbrushed skin, smooth perfect skin, "
+    "glowing skin, glossy skin, beauty filter, instagram filter, glamour shot, "
+    "magazine cover, professional fashion photography, studio lighting, retouched, "
+    "doll face, perfect symmetry, cartoon, illustration, painting, "
+    "deformed hands, extra fingers, missing fingers, fused fingers, deformed face, "
+    "extra limbs, ugly, blurry, lowres, fake, oversaturated, posterized"
 )
 
 print("=" * 60)
@@ -140,7 +147,6 @@ except Exception:
 
 try:
     print("[3/3] T2I pipeline...", flush=True)
-    # Try AutoPipeline.from_pipe first (shares components, no extra VRAM)
     t2i_pipe = None
     try:
         t2i_pipe = AutoPipelineForText2Image.from_pipe(pipe)
@@ -148,7 +154,6 @@ try:
     except Exception as e:
         print(f"  -> from_pipe failed ({e}); loading fresh", flush=True)
     if t2i_pipe is None:
-        # Fallback: load fresh - costs ~6GB extra VRAM but reliable
         t2i_pipe = StableDiffusionXLPipeline.from_pretrained(
             BASE_MODEL, torch_dtype=DTYPE, variant="fp16", use_safetensors=True,
         )
@@ -222,6 +227,28 @@ def save_characters_json(chars):
 
 def list_characters():
     return sorted(load_characters().keys())
+
+
+def list_chars_and_loras():
+    """Union of characters in library and LoRA folders, with markers."""
+    chars = set(load_characters().keys())
+    loras = set(list_loras())
+    out = []
+    for name in sorted(chars | loras):
+        if name in chars and name in loras:
+            out.append(name)
+        elif name in loras:
+            out.append(f"{name} (no traits)")
+        else:
+            out.append(f"{name} (no LoRA)")
+    return out
+
+
+def parse_char_choice(choice):
+    """Strip annotations like '(no traits)' / '(no LoRA)' from dropdown value."""
+    if not choice or choice == "(none)":
+        return ""
+    return choice.split(" (")[0]
 
 
 def ensure_lora_loaded(name):
@@ -307,7 +334,7 @@ def compute_source_embedding(source_images):
     return np.mean(np.stack(embs, axis=0), axis=0)
 
 
-# ============ SWAP (unchanged structurally) ============
+# ============ SWAP ============
 
 def swap_one(source_emb, target_path, lora_name=None):
     if not _PIPE_ON_GPU:
@@ -406,9 +433,7 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
     if not target_files:
         return None, "Drop at least one target."
 
-    lora_name = (character_lora or "").strip()
-    if lora_name == "(none)":
-        lora_name = ""
+    lora_name = parse_char_choice(character_lora)
     try:
         ensure_lora_loaded(lora_name if lora_name else None)
     except Exception as e:
@@ -445,7 +470,6 @@ def swap_batch(source_img, source_extras, target_files, character_lora, progress
 # ============ T2I GENERATE ============
 
 def deformity_check(image_bgr):
-    """Returns (passed: bool, reason: str). Simple checks: exactly 1 face, image not all-black."""
     if image_bgr is None or image_bgr.size == 0:
         return False, "empty"
     if np.mean(image_bgr) < 5:
@@ -459,11 +483,8 @@ def deformity_check(image_bgr):
 
 
 def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, use_random_scenes, steps, guidance, progress=gr.Progress(track_tqdm=False)):
-    """T2I generation with optional character LoRA + traits."""
     chars = load_characters()
-    character = (character or "").strip()
-    if character == "(none)":
-        character = ""
+    character = parse_char_choice(character)
 
     lora_name = None
     char_traits = ""
@@ -474,7 +495,6 @@ def generate_images(character, custom_scenario, n_images, aspect, nsfw_level, us
         char_neg    = (c.get("negative_traits") or "").strip()
         lora_name   = (c.get("preferred_lora") or character).strip() or None
 
-    # If character not in library but has a LoRA folder, use that
     if not lora_name and character in list_loras():
         lora_name = character
 
@@ -684,13 +704,13 @@ def show_status():
 
 def refresh_all_dropdowns():
     loras = ["(none)"] + list_loras()
-    chars = ["(none)"] + list_characters()
+    chars_and_loras = ["(none)"] + list_chars_and_loras()
     char_edit = ["(new)"] + list_characters()
     return (gr.update(choices=loras, value="(none)"),
-            gr.update(choices=chars, value="(none)"),
+            gr.update(choices=chars_and_loras, value="(none)"),
             gr.update(choices=char_edit, value="(new)"),
             gr.update(choices=loras, value="(none)"),
-            gr.update(choices=chars, value="(none)"))
+            gr.update(choices=chars_and_loras, value="(none)"))
 
 
 # ============ UI ============
@@ -713,10 +733,10 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
         swap_btn.click(swap_batch, [source, source_extras, targets, swap_lora], [swap_gallery, swap_status])
 
     with gr.Tab("Generate"):
-        gr.Markdown("Pick a character, choose a scenario (or random), generate.")
+        gr.Markdown("Pick a character (LoRA folders auto-listed), choose a scenario (or random), generate.")
         with gr.Row():
             with gr.Column():
-                t2i_char = gr.Dropdown(label="Character", choices=["(none)"] + list_characters(), value="(none)")
+                t2i_char = gr.Dropdown(label="Character", choices=["(none)"] + list_chars_and_loras(), value="(none)")
                 t2i_scenario = gr.Textbox(label="Custom scene (used if 'Random scenes' is OFF)", lines=2,
                                           placeholder="e.g. at the beach in a white bikini at sunset")
                 t2i_random = gr.Checkbox(label="Use random scenes from library (recommended)", value=True)
@@ -726,7 +746,7 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
                                          choices=["832x1216 (portrait)", "1024x1024 (square)", "1216x832 (landscape)"])
                 with gr.Accordion("Advanced", open=False):
                     t2i_steps = gr.Slider(label="Steps", minimum=15, maximum=50, value=T2I_STEPS, step=1)
-                    t2i_guidance = gr.Slider(label="Prompt strictness", minimum=1.5, maximum=8.0, value=T2I_GUIDANCE, step=0.1)
+                    t2i_guidance = gr.Slider(label="Prompt strictness (lower = more natural)", minimum=1.5, maximum=8.0, value=T2I_GUIDANCE, step=0.1)
                 t2i_btn = gr.Button("Generate", variant="primary", size="lg")
             with gr.Column():
                 t2i_gallery = gr.Gallery(label="Results (only deformity-passed shown)", columns=2, height=500)
@@ -740,7 +760,7 @@ with gr.Blocks(title="Easy Face Swap v2 (Cloud)") as demo:
                     "and run the swap pipeline to refine the face with that character's LoRA.")
         with gr.Row():
             with gr.Column():
-                approval_char = gr.Dropdown(label="Character", choices=["(none)"] + list_characters(), value="(none)")
+                approval_char = gr.Dropdown(label="Character", choices=["(none)"] + list_chars_and_loras(), value="(none)")
                 approval_source = gr.Image(label="Source face (optional — if blank, uses LoRA only)", type="numpy", height=300)
                 approval_images = gr.Files(label="Approved images (drag from Generate output folder)", file_types=["image"], file_count="multiple")
             with gr.Column():
