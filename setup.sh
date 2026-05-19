@@ -1,11 +1,7 @@
 #!/bin/bash
-# NOTE: removed `set -e` and added trap so the diagnostic HTTP fallback ALWAYS runs.
-# If anything fails (pip install, model download, python crash), the trap fires
-# and serves /workspace via HTTP on 7860 so we can read the logs in the browser.
 LOG=/workspace/boot.log
 exec > >(tee -a "$LOG") 2>&1
 
-# === FALLBACK: always run on exit ===
 fallback() {
     EXIT_CODE=$?
     echo "" | tee -a /workspace/runtime.log
@@ -26,8 +22,8 @@ a { color: #5af; } pre { background: #222; padding: 12px; border-radius: 4px; ma
 <h1>Easy Face Swap - DIAGNOSTIC MODE</h1>
 <p>Setup or v2 crashed. Logs below:</p>
 <p>
-<a href="/boot.log">boot.log</a> | 
-<a href="/runtime.log">runtime.log</a> | 
+<a href="/boot.log">boot.log</a> |
+<a href="/runtime.log">runtime.log</a> |
 <a href="/v2_startup_error.log">v2_startup_error.log</a>
 </p>
 <h2>boot.log (tail)</h2><pre id="boot">loading...</pre>
@@ -63,7 +59,9 @@ pip install -q -U pip || echo "pip upgrade FAILED"
 pip install -q -U 'gradio>=5,<6' || { echo "GRADIO INSTALL FAILED"; exit 1; }
 pip install -q 'transformers==4.46.3' 'diffusers==0.31.0' 'peft==0.13.2' 'accelerate==1.1.1' 'huggingface_hub==0.25.2' || { echo "core libs FAILED"; exit 1; }
 pip install -q insightface onnxruntime-gpu 'opencv-python<5' einops 'numpy<2' pillow-heif || { echo "image libs FAILED"; exit 1; }
-# Training-only deps - failure not critical for app
+# Anthropic SDK for Smart Swap (Claude Haiku judging)
+pip install -q anthropic || echo "anthropic SDK install FAILED (Smart Swap will fall back to math judging)"
+# Training-only deps
 pip install -q bitsandbytes datasets prodigyopt tensorboard || echo "training libs FAILED (non-critical)"
 
 echo "--- versions ---"
@@ -131,8 +129,5 @@ export HF_HOME=/workspace/hf_cache
 
 echo "--- launching app ==="
 cd "$(dirname "$0")"
-# Run cloud_swap.py. If it exits/crashes, the trap fires and runs the fallback.
-# Use exec so cloud_swap.py replaces this shell — but exec WON'T trigger trap on success.
-# So we DON'T exec; we run it and let the trap handle whatever happens.
 python cloud_swap.py 2>&1 | tee -a /workspace/runtime.log
 echo "=== cloud_swap.py returned (this is unusual - gradio should not exit) ==="
