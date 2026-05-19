@@ -127,40 +127,45 @@ POSES = [
     "post-shower, towel-drying hair",
 ]
 
+# Lighting — removed studio/softbox terms that polish too much, kept naturalistic
 LIGHTING = [
     "soft natural daylight from a window",
     "golden hour warm light",
     "harsh direct sunlight",
     "dim bedroom lighting",
     "candlelight, warm and intimate",
-    "neon-pink glow from a sign",
     "morning light coming through sheer curtains",
     "blue hour soft light",
-    "studio softbox lighting",
-    "harsh on-camera flash, vivid colors",
+    "harsh direct flash from a phone, slight overexposure",
     "moody low-key lighting",
     "bright midday sun by the pool",
     "warm tungsten room lighting",
+    "uneven lighting from a single lamp",
+    "fluorescent bathroom lighting",
 ]
 
+# Camera — heavily weighted to amateur phone photos, removed pro fashion shoot
 CAMERA_STYLE = [
-    "iPhone selfie",
-    "iPhone front camera, candid",
-    "DSLR portrait, shallow depth of field",
-    "professional fashion shoot",
-    "boyfriend shot, casual photo",
-    "instagram story selfie",
-    "phone held in hand, mirror reflection",
-    "tilted phone angle, lifestyle vlog",
-    "polaroid style, slight grain",
-    "amateur snapshot, slightly off-center",
+    "iPhone selfie, low quality, natural skin texture",
+    "iPhone front camera, candid, slight motion blur",
+    "boyfriend shot, casual phone photo",
+    "instagram story screenshot, slight compression artifacts",
+    "phone held in hand, mirror reflection, smudged mirror",
+    "tilted phone angle, lifestyle vlog still frame",
+    "polaroid style, slight grain, faded colors",
+    "amateur snapshot, slightly off-center, not posed",
+    "phone camera, dim indoor lighting, ISO grain",
+    "instagram reel still frame, slight compression",
+    "candid phone photo, hand-held shake",
 ]
 
+# Quality — pushed AWAY from "ultra high res" toward amateur realism
 QUALITY_TAGS = [
-    "ultra high resolution, sharp focus, photorealistic, fine skin pores",
-    "raw photo, unedited, natural skin texture",
-    "candid photograph, sharp focus, film grain",
-    "high resolution photo, natural lighting, detailed",
+    "real skin texture with visible pores and blemishes, no smoothing",
+    "raw unedited photo, no filter applied, natural skin tone",
+    "amateur snapshot quality, slight ISO grain, real human imperfections",
+    "candid phone photo, slight noise in shadows, natural skin",
+    "no makeup retouching, real skin under uneven light, slight redness",
 ]
 
 
